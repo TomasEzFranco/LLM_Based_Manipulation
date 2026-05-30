@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "default_repeats": 10,
+  "prompts": [
+    {
+      "id": "prompt_1_color_split",
+      "steps_required_default": 6,
+      "initial_condition": "L=;R=;P=B3O3",
+      "text": "1. Stack Blue cubes left.\n2. Stack Orange cubes right.\n3. Use pick_placed_left/right to make corrections."
+    },
+    {
+      "id": "prompt_2_orange_right",
+      "steps_required_default": 3,
+      "initial_condition": "L=OOB;R=;P=O1",
+      "text": "1. Stack all orange cubes on right stack only.\n2. Left stack should be empty.\n3. Use pick_placed_left/right to make the required correction.\n4. Use stop_run when 3 orange cubes stacked on right."
+    },
+    {
+      "id": "prompt_3_alternating_two_stacks",
+      "steps_required_default": 8,
+      "initial_condition": "L=BBO;R=BBO;P=",
+      "text": "1. Build TWO stacks, each exactly 3 cubes high.\n2. Fill LEFT stack first, then RIGHT stack.\n3. Required pattern for each stack (bottom to top): BLUE, ORANGE, BLUE.\n4. If centered cube color is not legal for the current target stack level, use pick_other before grasp.\n5. Use pick_placed_left/right only to correct a placed stack that violates the required pattern.\n6. Use stop_run only when LEFT and RIGHT are both [BLUE, ORANGE, BLUE]."
+    }
+  ]
+}

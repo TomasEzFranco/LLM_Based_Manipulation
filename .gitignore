@@ -1,0 +1,31 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local/editor state
+.cursor/
+.vscode/
+.idea/
+desktop.ini
+
+# Runtime/test outputs
+results/
+Test Results/
+*.log
+
+# Large model artifacts
+*.pt
+*.onnx
+*.engine
+
+# Generated media/artifacts
+*.mp4
+*.avi
+*.png
+*.jpg
+*.jpeg
+
+# Environment/local secrets
+.env
+.env.*
