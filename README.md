@@ -18,10 +18,10 @@ The runtime is intended for a Windows workstation connected to:
 - Quanser QArm hardware.
 - Quanser PAL/HAL Python libraries.
 - Intel RealSense camera and `pyrealsense2`.
-- A local YOLO cube detector model such as `best.pt`.
+- The included YOLO cube detector model, `best.pt`.
 - A local LLM backend used by `llm_commander/planner/live_policy_brain.py`.
 
-Large model files and run outputs are ignored by git. Keep model weights and trial results local unless they are archived separately.
+The default detector model `best.pt` is included because the runtime expects it at the repository root. Other model experiments and run outputs are ignored by git.
 
 ## Running The Robot Runtime
 
@@ -277,7 +277,7 @@ The repository intentionally ignores:
 - `results/`
 - `Test Results/`
 - Python caches.
-- YOLO/model artifacts such as `*.pt`, `*.onnx`, and `*.engine`.
+- Extra YOLO/model artifacts such as `*.pt`, `*.onnx`, and `*.engine`, except the included default `best.pt`.
 - Generated videos, images, and logs.
 
 This keeps the public repository focused on source code, prompts, tests, and experiment tooling.

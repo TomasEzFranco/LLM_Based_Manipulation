@@ -16,6 +16,7 @@ Test Results/
 
 # Large model artifacts
 *.pt
+!best.pt
 *.onnx
 *.engine
 
