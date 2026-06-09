@@ -1,171 +1,283 @@
-# `llm_commander_refactored`
+# LLM_Based_Manipulation
 
-## Summary
-This folder is a **guarded, standalone runtime** for refactoring `LLM_Commander` without touching the original control script.
+This repository contains the software used for a thesis project on LLM-based robotic manipulation with a Quanser QArm. The system uses computer vision, cube tracking, structured robot actions, and an LLM policy to sort and stack colored cubes.
 
-It is currently in **M0+M1**:
-1. M0: frozen baseline copy + manifest/version guard.
-2. M1: thin main script + extracted runtime loop/module wiring with behavior-preserving intent.
+The project is organized around a real hardware loop:
 
-Practical meaning:
-1. You can run experiments here without modifying the legacy runtime.
-2. Model, prompt, and results default locally to this folder.
-3. Core behavior still comes from `runtime_core.py` while extraction proceeds.
+1. Detect cubes with YOLO and RealSense depth.
+2. Center the camera/arm on a target cube.
+3. Ask an LLM policy to choose the next legal command.
+4. Execute grasp, place, correction, or stop actions.
+5. Verify stack state with geometry, color, and depth measurements.
+6. Record trial logs and CSV summaries for analysis.
 
-## Goals
-1. Keep original root runtime untouched.
-2. Preserve behavior while making control flow easier to read/explain.
-3. Keep assets and outputs local for clean experimental provenance.
+## Hardware And Dependencies
 
-## Run
-From project root:
+The runtime is intended for a Windows workstation connected to:
 
-```bash
-python3 LLM_Commander_refactored_launcher.py
+- Quanser QArm hardware.
+- Quanser PAL/HAL Python libraries.
+- Intel RealSense camera and `pyrealsense2`.
+- A local YOLO cube detector model such as `best.pt`.
+- A local LLM backend used by `llm_commander/planner/live_policy_brain.py`.
+
+Large model files and run outputs are ignored by git. Keep model weights and trial results local unless they are archived separately.
+
+## Running The Robot Runtime
+
+From the repository root:
+
+```powershell
+python LLM_Commander.py
 ```
 
-Tune mode:
+`LLM_Commander.py` is a thin entrypoint that starts the prompted runtime loop in `runtime_loop.py`.
 
-```bash
-python3 LLM_Commander_refactored_launcher.py --mode tune
+The default policy prompt is:
+
+```text
+llm_commander/prompts/live_sort_operator_v22.txt
 ```
 
-Tune behavior highlights:
-1. If failures streak to `QARM_TUNE_MAX_FAILS`, tune restores **best-so-far** camera offsets and grasp-z fraction, then continues.
-2. This recovery is bounded by `QARM_TUNE_MAX_FAIL_RECOVERIES`.
-3. Tune can also adjust `GRASP_Z_PICK_FRACTION` (`QARM_TUNE_ENABLE_GRASP_Z_TUNE=1` by default).
-4. Grasp Z now uses a top-cube model: `z_pick = z_measured - (1-frac) * cube_edge` (see `QARM_GRASP_CUBE_EDGE_M`).
+Older prompt versions are kept in `llm_commander/prompts/` for comparison and rollback.
 
-Or run directly:
+## How The Runtime Works
 
-```bash
-cd llm_commander_refactored
-python3 LLM_Commander.py
+The runtime is a constrained action loop. The LLM does not directly control motors. Instead, each cycle builds a JSON state summary and gives the LLM a list of legal commands.
+
+Typical commands include:
+
+- `observe_scene`
+- `classify_cube`
+- `grasp_cube`
+- `pick_other`
+- `place_left`
+- `place_right`
+- `place_left_stack`
+- `place_right_stack`
+- `pick_placed_left`
+- `pick_placed_right`
+- `pick_misplaced_left`
+- `pick_misplaced_right`
+- `return_cube`
+- `stop_run`
+
+The LLM returns one command and a reason. The runtime validates that command against the current phase before executing it.
+
+## Policy State
+
+The policy receives a compact `INPUT_JSON` payload with:
+
+- The mission prompt.
+- The current phase: observe, classification, grasp, or place.
+- Whether the robot is holding a cube.
+- The centered pick target or held cube color.
+- Left and right stack status.
+- The commands that are currently allowed.
+
+The policy does not receive raw camera frames or unrestricted robot state.
+
+## Perception And Tracking
+
+The perception stack uses:
+
+- YOLO detections for cube candidates.
+- RealSense depth for 3D projection.
+- Track memory for continuity while centering.
+- Color classification from image patches.
+- Stack-aware geometry checks for placed cubes.
+
+Track IDs are helpful for continuity, but they are not treated as physical cube identity. For stacked cubes, the runtime uses side, layer, XYZ position, color, and confidence.
+
+## Grasping And Placing
+
+`pick_actions.py` handles pick-space grasps and `pick_other`.
+
+`place_actions.py` handles base placements and stack placements. Stack placements use a stable base anchor so the stack column does not drift as higher layers are verified.
+
+Recent stack placement behavior:
+
+- Stack X can be adjusted from the measured pick position.
+- Third-layer stack X has a small command-only correction.
+- Third-layer release Z uses the same stack height step as the second layer.
+- Verification targets remain nominal, while command-only offsets are logged separately.
+
+## Verification
+
+`verify_v2.py` checks whether a placement succeeded. It combines:
+
+- Expected slot geometry.
+- Measured XYZ from depth.
+- XY and Z margins.
+- Color checks when trusted.
+- Target-side top candidate checks.
+- Startup hydrate recovery when needed.
+
+The verify ladder is designed to fail with clear logs instead of silently accepting uncertain stack state.
+
+## Correction Actions
+
+Correction commands remove cubes from existing stack areas:
+
+- `pick_placed_left`
+- `pick_placed_right`
+- `pick_misplaced_left`
+- `pick_misplaced_right`
+
+These actions explicitly target a side and prefer the top cube. They verify section and height after centering so a correction pick does not accidentally grab a lower cube.
+
+## Experiment Runner
+
+The experiment runner is:
+
+```text
+tools/run_prompt_trials.py
 ```
 
-## Local Defaults
-When run via launcher or from this folder:
-1. Model defaults to `llm_commander_refactored/best.pt`.
-2. Prompt defaults to `llm_commander_refactored/llm_commander/prompts/live_sort_operator_v10.txt`.
-3. Results default under `llm_commander_refactored/Test Results/...`.
-4. Policy raw traces default under `llm_commander_refactored/Test Results/live_policy_runs/...`.
-5. Tune trials default under `llm_commander_refactored/Test Results/tune_runs/...`.
+It repeatedly launches `LLM_Commander.py` with prompts from:
 
-## Calibration Profiles
-1. Tune mode writes a baseline snapshot and tuned profiles under `llm_commander_refactored/tune_profiles/`.
-2. Tune mode updates `tune_profiles/latest.json` with the best tuned offsets from that run.
-3. Tune profiles include camera offsets and `grasp_z_pick_fraction`.
-4. Prompted mode now auto-loads `tune_profiles/latest.json` when present (can be disabled):
-
-```bash
-QARM_CALIB_PROFILE_AUTO=0 \
-python3 LLM_Commander_refactored_launcher.py
+```text
+experiments/prompts.json
 ```
 
-5. Explicit path still overrides auto-load:
+Default run:
 
-```bash
-QARM_CALIB_PROFILE_PATH=/abs/path/to/llm_commander_refactored/tune_profiles/latest.json \
-python3 LLM_Commander_refactored_launcher.py
+```powershell
+python tools/run_prompt_trials.py
 ```
 
-When loaded, the profile now applies both:
-1. `cam_off_x_m / cam_off_y_m / cam_off_z_m`
-2. `grasp_z_pick_fraction` (if present in the profile)
+Useful commands:
 
-## Default Stack Locations (Current Runtime)
-These are the default place-stack target locations used by `runtime_core.py` before env overrides:
-1. Grid center: `x=0.390`, `y=0.180` (`QARM_PLACE_GRID_CENTER_Y_M` default derives from `PLACE_LOOKING.y + 0.06`).
-2. Grid spacing: `dx=0.070`, `dy=0.090`.
-3. Base slot coordinates generated from that grid:
-   - slot 0: `(0.460, 0.090, 0.037)`
-   - slot 1: `(0.460, 0.270, 0.037)`
-4. Logical section mapping (after runtime mirror swap):
-   - `left` stack uses the higher-`y` base slot (`~y=0.270`).
-   - `right` stack uses the lower-`y` base slot (`~y=0.090`).
-
-Useful related tolerances:
-1. Verify XY margin default: `QARM_PLACE_VERIFY_V2_XY_MARGIN_M=0.046`.
-2. Section assignment XY distance default: `QARM_SCENE_RECON_SECTION_MAX_DIST_M=0.075`.
-
-## How It Is Wired
-End-to-end execution path:
-1. Root launcher `LLM_Commander_refactored_launcher.py` starts Python in this folder.
-2. `LLM_Commander.py` is intentionally thin and calls `runtime_loop.main_prompted()`.
-3. `runtime_loop.py` holds prompted orchestration and action dispatch.
-4. `planner_io.py` and `verify_v2.py` are called from `runtime_loop`.
-5. In M1, those modules mostly forward to `runtime_core.py` to preserve behavior while structure is improved.
-
-## Module Roles
-1. `LLM_Commander.py`: thin entrypoint.
-2. `runtime_loop.py`: high-level prompted loop and command dispatch.
-3. `runtime_core.py`: source-of-truth runtime behavior during M0+M1.
-4. `planner_io.py`: planner setup, allowed command shaping, planner-state shaping, raw trace append.
-5. `verify_v2.py`: verification interface export.
-6. `centering.py`: centering API export.
-7. `grasp_place.py`: grasp/place API export.
-8. `hardware_io.py`: Arm/Perception/Detector exports.
-9. `geometry_perception.py`: projection/depth/transform helper exports.
-10. `tracking_overlay.py`: track memory/selection/overlay exports.
-11. `state_types.py`: shared dataclass exports.
-12. `mission_guard.py`: M2 placeholder (currently pass-through).
-
-## What Is Intentionally Different From Legacy Runtime
-This workspace is not byte-identical by design. Intentional differences:
-1. File/path defaults are folder-local for model/prompt/results.
-2. Import priority is forced local in `runtime_core.py` (`sys.path` prepended with runtime base dir).
-3. Planner default prompt path in `live_policy_brain.py` is file-relative in this folder.
-4. Startup entry flow is modularized (`LLM_Commander.py` -> `runtime_loop.py`).
-
-These changes are for isolation and reproducibility, not task-policy behavior changes.
-
-## Recent Behavior Updates (And Why)
-1. Added pre-grasp `classify -> pick_other` support by seeding pick-other block context from the currently classified cube (`track_id`, `uv`, `xyz` median).
-Why: this allows the LLM to deliberately switch target cube before committing to `grasp_cube`.
-2. Added `pick_other_block_source` (`none|classify|return`) and exposed planner-state `pick_options.pick_other_source`.
-Why: this keeps LLM decision context explicit and reduces ambiguous pick-other usage.
-3. `pick_other` stays one-shot: block context clears on successful alternate lock, but persists on `observe_retry`.
-Why: this prevents stale exclusions while still allowing repeated retries in hard scenes.
-4. `return_cube -> pick_other` path remains intact.
-Why: preserves the original reroute behavior while expanding autonomy earlier in the flow.
-
-## Behavior Parity Expectation
-Target for M0+M1 is behavior-preserving execution with structural cleanup.
-
-Recommended parity validation on hardware:
-1. One static stack mission.
-2. One alternating stack mission.
-3. Compare command stream, verify statuses, stop reason, completion reliability, and timing.
-
-## Version Guard / Baseline Manifest
-Critical frozen files and hashes are tracked in `BASELINE_MANIFEST.json`.
-
-Regenerate after intentional critical-file updates:
-
-```bash
-python3 llm_commander_refactored/tools/regenerate_baseline_manifest.py
+```powershell
+python tools/run_prompt_trials.py --repeats 10
+python tools/run_prompt_trials.py --session FinalVideoTrials
+python tools/run_prompt_trials.py --prompt-id prompt_2_orange_right --repeats 2
+python tools/run_prompt_trials.py --resume results/FinalVideoTrials
+python tools/run_prompt_trials.py --resume results/FinalVideoTrials --delete-trials 2,4,8-10
+python tools/run_prompt_trials.py --dry-run --repeats 1
 ```
 
-Verify:
+The runner is interactive. Before each trial it prints:
 
-```bash
-python3 llm_commander_refactored/tools/verify_baseline_manifest.py
+- Trial ID.
+- Prompt ID.
+- Repeat index.
+- Prompt text.
+- Expected initial condition.
+- Trial output folder.
+
+The operator sets the physical scene, starts video capture if needed, and presses Enter to launch.
+
+## Initial Condition Notation
+
+The runner uses compact setup strings:
+
+```text
+L=BOB;R=;P=B3O3
+L=OOB;R=;P=O1
+L=BOB;R=B;P=2O
 ```
 
-## Key Files To Know
-1. `LLM_Commander_original_snapshot.py`: frozen baseline snapshot for comparison.
-2. `runtime_core.py`: main behavior file during this phase.
-3. `llm_commander/planner/live_policy_brain.py`: live policy backend adapter.
-4. `llm_commander/prompts/live_sort_operator_v10.txt`: active planner system prompt.
-5. `llm_commander/prompts/live_sort_operator_v8.txt` and `live_sort_operator_v9.txt`: preserved prior prompt versions.
-6. `BASELINE_MANIFEST.json`: cryptographic manifest of critical assets.
+Meaning:
 
-## Current Phase Status
-1. M0 complete: isolated folder, copied assets, manifest tooling.
-2. M1 in progress: loop extraction and module wiring in place; deeper logic migration still ongoing.
-3. M2 not active yet: mission guard logic is scaffolded but pass-through.
+- `L` is the left stack from bottom to top.
+- `R` is the right stack from bottom to top.
+- `P` is the pick-space inventory.
+- `B` means blue.
+- `O` means orange.
 
-## Notes for Thesis/Demo Use
-1. Use this folder as experimental runtime so baseline remains preserved.
-2. Keep mission prompt/model/think-mode fixed per run for fair comparisons.
-3. Archive raw policy trace and verification logs per trial for post-hoc analysis.
+## Trial Outputs
+
+Each trial creates:
+
+```text
+results/<session>/trial_0001/
+results/<session>/trial_0001/console_log.txt
+results/<session>/trial_0001/trial_meta.json
+```
+
+Each session creates:
+
+```text
+results/<session>/trials.csv
+results/<session>/failures.csv
+results/<session>/summary.csv
+results/<session>/progress.json
+```
+
+The CSV files include:
+
+- Final result: success, partial, fail, or aborted.
+- Completion ratio.
+- Runtime action counts.
+- Recovery counts.
+- Verify statistics.
+- Final left/right stack state.
+- Parsed failure stage and failure source.
+- Operator notes and video filename.
+
+See `docs/prompt_trial_runner.md` for the detailed runner reference.
+
+## Prompt Set
+
+The current experiment prompt file contains four prompt families:
+
+- `prompt_1_color_split`: blue cubes left, orange cubes right.
+- `prompt_2_orange_right`: all orange cubes on the right stack.
+- `prompt_3_alternating_two_stacks`: both stacks should be blue-orange-blue.
+- `prompt_4_alternating_correction`: correction-heavy alternating stack task.
+
+Prompt IDs should stay stable when resuming experiment sessions.
+
+## Main Files
+
+```text
+LLM_Commander.py                         Runtime entrypoint.
+runtime_loop.py                          Main prompted control loop.
+runtime_loop_cycle.py                    One policy/action cycle.
+runtime_loop_actions_*.py                Action-specific loop handlers.
+runtime_core.py                          Constants, hardware wrapper, shared helpers.
+vision_runtime.py                        YOLO and RealSense runtime.
+projection_geometry.py                   Depth and base-frame projection.
+centering.py                             Visual centering.
+pick_actions.py                          Grasp and pick_other actions.
+place_actions.py                         Place and stack actions.
+misplaced_actions.py                     Correction actions.
+verify_v2.py                             Placement verification.
+stack_scene.py                           Stack state and anchors.
+planner_io.py                            Policy input/output helpers.
+tools/run_prompt_trials.py               Experiment runner.
+tests/offline_smoke_tests.py             Offline import and helper tests.
+```
+
+## Validation
+
+Offline checks do not touch the real robot:
+
+```powershell
+python -m py_compile runtime_core.py runtime_loop.py runtime_loop_observe.py place_actions.py verify_v2.py tools\run_prompt_trials.py tests\offline_smoke_tests.py
+python -m unittest tests.offline_smoke_tests
+python tools\run_prompt_trials.py --dry-run --repeats 1
+```
+
+## Safety Notes
+
+This repository controls physical robot hardware. Use caution during live runs.
+
+- Keep hands clear of the QArm workspace.
+- Use small, reviewable parameter changes.
+- Prefer explicit failures and clear logs over hidden fallback behavior.
+- Do not tune current limits casually.
+- If repeated Quanser HIL timeout messages appear, treat the run as a hardware communication failure and reset the hardware path before retrying.
+
+## Git-Ignored Outputs
+
+The repository intentionally ignores:
+
+- `results/`
+- `Test Results/`
+- Python caches.
+- YOLO/model artifacts such as `*.pt`, `*.onnx`, and `*.engine`.
+- Generated videos, images, and logs.
+
+This keeps the public repository focused on source code, prompts, tests, and experiment tooling.

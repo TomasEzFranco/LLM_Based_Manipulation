@@ -131,6 +131,7 @@ from stack_scene import (
     _verify_section_y_centers,
     append_authoritative_stack_cube,
     apply_startup_stack_hydration,
+    apply_startup_stack_hydration_for_section,
     build_place_grid_slots,
     get_authoritative_stack_levels,
     get_latest_confirmed_active_stack_placement,
@@ -207,7 +208,7 @@ except Exception as _direct_import_exc:
 
 DEFAULT_RESULTS_ROOT = RUNTIME_BASE_DIR / "Test Results"
 DEFAULT_YOLO_MODEL_PATH = RUNTIME_BASE_DIR / "best.pt"
-DEFAULT_POLICY_PROMPT_PATH = RUNTIME_BASE_DIR / "llm_commander" / "prompts" / "live_sort_operator_v21.txt"
+DEFAULT_POLICY_PROMPT_PATH = RUNTIME_BASE_DIR / "llm_commander" / "prompts" / "live_sort_operator_v22.txt"
 # Baseline de-bloat checklist (implementation guardrails):
 # - Keep CLI and env variable compatibility stable.
 # - Refactor large procedural blocks into smaller staged helpers.
@@ -234,7 +235,7 @@ EMPTY_SCENE_CONFIRM_PASSES = 2
 MAX_CYCLES_WITHOUT_PLACE_PROGRESS = 3
 YOLO_MODEL_PATH = str(DEFAULT_YOLO_MODEL_PATH)
 TARGET_CLASSES = ("Cube",)
-YOLO_CONF = float(os.getenv("QARM_YOLO_CONF", "0.45"))  # base detector threshold (Bot-SORT low-conf cascade)
+YOLO_CONF = float(os.getenv("QARM_YOLO_CONF", "0.55"))  # base detector threshold (Bot-SORT low-conf cascade)
 SHOW_WINDOW = True
 WINDOW_NAME = "YOLO Detection - QArm"
 UI_MODE = os.getenv("QARM_UI_MODE", "minimal").strip().lower()
@@ -463,7 +464,8 @@ PLACE_GRID_CENTER_Y_M = float(os.getenv("QARM_PLACE_GRID_CENTER_Y_M", "0.1625"))
 _MISSION_PROMPT_P1_COLOR_SPLIT = (
     "1. Stack Blue cubes left.\n"
     "2. Stack Orange cubes right.\n"
-    "3. Use pick_placed_left/right to make corrections."
+    "3. Use pick_placed_left/right to make corrections.\n"
+    "4. Use stop_run only when left has 3 blue cubes and right has 3 orange cubes."
 )
 _MISSION_PROMPT_P2_ORANGE_RIGHT = (
     "1. Stack all orange cubes on right stack only.\n"
@@ -474,20 +476,25 @@ _MISSION_PROMPT_P2_ORANGE_RIGHT = (
 _MISSION_PROMPT_P3_ALTERNATING = (
     "1. Build TWO stacks, each exactly 3 cubes high.\n"
     "2. Fill LEFT stack first, then RIGHT stack.\n"
-    "3. Required pattern for each stack (bottom to top): BLUE, ORANGE, BLUE.\n"
-    "4. If centered cube color is not legal for the current target stack level, use pick_other before grasp.\n"
+    "3. Required pattern for each stack (bottom to top): BLUE, ORANGE, BLUE; "
+    "cube_count 0 needs BLUE, cube_count 1 needs ORANGE, cube_count 2 needs BLUE.\n"
+    "4. If centered cube color is not legal for the current LEFT-first target stack level, use pick_other before grasp_cube.\n"
     "5. Use pick_placed_left/right only to correct a placed stack that violates the required pattern.\n"
     "6. Use stop_run only when LEFT and RIGHT are both [BLUE, ORANGE, BLUE]."
 )
-# Prompt 4 (push test):
-# "1. Use push_cube once on the centered pick-space cube.\n"
-# "2. Then use stop_run immediately."
+_MISSION_PROMPT_P4_ALTERNATING_CORRECTION = (
+    "1. Stack blue orange blue left.\n"
+    "2. Stack orange blue orange right.\n"
+    "3. Use pick_misplaced only to correct a placed stack that violates the required pattern.\n"
+    "4. If centered cube color is not legal for the current target stack level, use pick_other before grasp_cube.\n"
+    "5. Use stop_run when left is blue orange blue and right is orange blue orange."
+)
 MISSION_PROMPT = os.getenv("QARM_MISSION_PROMPT", _MISSION_PROMPT_P3_ALTERNATING)
 # Keep stack height scalar defined before any env defaults that reference it.
 STACK_LEVEL_DZ_M = float(os.getenv("QARM_STACK_LEVEL_DZ_M", "0.060"))
 PLACE_STACK_LEVEL_DZ_M = float(os.getenv("QARM_PLACE_STACK_LEVEL_DZ_M", "0.060"))
-PLACE_STACK_UPPER_EXTRA_Z_M = float(os.getenv("QARM_PLACE_STACK_UPPER_EXTRA_Z_M", "0.003"))
-PLACE_STACK_LEVEL3_EXTRA_Z_M = float(os.getenv("QARM_PLACE_STACK_LEVEL3_EXTRA_Z_M", "0.005"))
+PLACE_STACK_UPPER_EXTRA_Z_M = float(os.getenv("QARM_PLACE_STACK_UPPER_EXTRA_Z_M", "0.005"))
+PLACE_STACK_LEVEL3_EXTRA_Z_M = float(os.getenv("QARM_PLACE_STACK_LEVEL3_EXTRA_Z_M", "0.000"))
 MISPLACED_RETURN_DROP_X_M = float(
     os.getenv(
         "QARM_MISPLACED_RETURN_DROP_X_M",
@@ -516,7 +523,7 @@ MISPLACED_RETURN_GRID_DX_M = float(
     os.getenv("QARM_MISPLACED_RETURN_GRID_DX_M", "-0.115")
 )
 MISPLACED_RETURN_GRID_DY_M = float(
-    os.getenv("QARM_MISPLACED_RETURN_GRID_DY_M", "-0.125")
+    os.getenv("QARM_MISPLACED_RETURN_GRID_DY_M", "-0.126")
 )
 MISPLACED_PICK_REQUIRED_HITS = int(os.getenv("QARM_MISPLACED_PICK_REQUIRED_HITS", "8"))
 MISPLACED_PICK_MEASURE_SAMPLES = int(os.getenv("QARM_MISPLACED_PICK_MEASURE_SAMPLES", "8"))
@@ -647,6 +654,9 @@ GRASP_FAR_XY_Z_LIFT_M = float(os.getenv("QARM_GRASP_FAR_XY_Z_LIFT_M", "0.0000"))
 GRASP_PICK_X_BIAS_M = float(os.getenv("QARM_GRASP_PICK_X_BIAS_M", "0.005"))#.1 works but sketchy
 GRASP_PICK_Y_BIAS_M = float(os.getenv("QARM_GRASP_PICK_Y_BIAS_M", "0.000"))#.06
 PICK_MISPLACED_GRASP_X_OFFSET_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_X_OFFSET_M", "0.000"))
+# Positive X compensates top-face centering skew that lands correction grasps too close (-X).
+PICK_MISPLACED_GRASP_X_PER_LEVEL_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_X_PER_LEVEL_M", "0.008"))
+PICK_MISPLACED_GRASP_X_MAX_ABS_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_X_MAX_ABS_M", "0.0065"))
 PICK_MISPLACED_GRASP_Y_OFFSET_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_Y_OFFSET_M", "0.000"))
 PICK_MISPLACED_GRASP_Y_PER_LEVEL_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_Y_PER_LEVEL_M", "0.005"))
 PICK_MISPLACED_GRASP_Y_MAX_M = float(os.getenv("QARM_PICK_MISPLACED_GRASP_Y_MAX_M", "0.010"))
@@ -662,19 +672,44 @@ PLACE_CMD_OFFSET_SKIP_STACK_ANCHOR = _env_bool("QARM_PLACE_CMD_OFFSET_SKIP_STACK
 PLACE_CMD_X_OFFSET_M = float(os.getenv("QARM_PLACE_CMD_X_OFFSET_M", "0.007"))
 PLACE_CMD_Y_OFFSET_M = float(os.getenv("QARM_PLACE_CMD_Y_OFFSET_M", "-0.021"))
 STACK_X_LEVEL_OFFSET_ENABLED = _env_bool("QARM_STACK_X_LEVEL_OFFSET_ENABLED", False)
-STACK_X_LEVEL1_OFFSET = float(os.getenv("QARM_STACK_X_LEVEL1_OFFSET", "0.005"))
-STACK_X_LEVEL2_OFFSET = float(os.getenv("QARM_STACK_X_LEVEL2_OFFSET", "0.010"))
+STACK_X_LEVEL1_OFFSET = float(os.getenv("QARM_STACK_X_LEVEL1_OFFSET", str(PICK_MISPLACED_GRASP_X_PER_LEVEL_M)))
+STACK_X_LEVEL2_OFFSET = float(os.getenv("QARM_STACK_X_LEVEL2_OFFSET", str(2.0 * PICK_MISPLACED_GRASP_X_PER_LEVEL_M)))
 STACK_PICK_X_OFFSET_ENABLED = _env_bool("QARM_STACK_PICK_X_OFFSET_ENABLED", True)
 STACK_PICK_X_OFFSET_REQUIRE_PICK_X = _env_bool("QARM_STACK_PICK_X_OFFSET_REQUIRE_PICK_X", True)
 STACK_PICK_X_NEAR_M = float(os.getenv("QARM_STACK_PICK_X_NEAR_M", "0.320"))
 STACK_PICK_X_FAR_M = float(os.getenv("QARM_STACK_PICK_X_FAR_M", "0.526"))
-STACK_PICK_X_OFFSET_NEAR_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_NEAR_M", "-0.006"))
-STACK_PICK_X_OFFSET_FAR_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_FAR_M", "0.01"))
-STACK_PICK_X_OFFSET_CLAMP_MIN_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_CLAMP_MIN_M", "-0.005"))
-STACK_PICK_X_OFFSET_CLAMP_MAX_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_CLAMP_MAX_M", "0.01"))
+STACK_PICK_X_OFFSET_NEAR_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_NEAR_M", "-0.016"))
+STACK_PICK_X_OFFSET_FAR_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_FAR_M", "-0.002"))
+STACK_PICK_X_OFFSET_CLAMP_MIN_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_CLAMP_MIN_M", "-0.016"))
+STACK_PICK_X_OFFSET_CLAMP_MAX_M = float(os.getenv("QARM_STACK_PICK_X_OFFSET_CLAMP_MAX_M", "0.004"))
+STACK_PICK_X_OFFSET_ALLOW_POSITIVE = _env_bool("QARM_STACK_PICK_X_OFFSET_ALLOW_POSITIVE", True)
+STACK_PICK_X_LEVEL2_EXTRA_M = float(os.getenv("QARM_STACK_PICK_X_LEVEL2_EXTRA_M", "-0.005"))
+STACK_PICK_X_NEAR_Z_EXTRA_M = float(os.getenv("QARM_STACK_PICK_X_NEAR_Z_EXTRA_M", "0.003"))
+STACK_PICK_X_FAR_Z_EXTRA_M = float(os.getenv("QARM_STACK_PICK_X_FAR_Z_EXTRA_M", "0.002"))
+_STACK_ANCHOR_X_COMP_DEFAULT_ENABLED = _env_bool("QARM_STACK_HYDRATE_ANCHOR_X_COMP_ENABLED", True)
+STACK_ANCHOR_X_COMP_ENABLED = _env_bool(
+    "QARM_STACK_ANCHOR_X_COMP_ENABLED",
+    _STACK_ANCHOR_X_COMP_DEFAULT_ENABLED,
+)
+STACK_ANCHOR_X_COMP_LEVEL1_M = float(
+    os.getenv(
+        "QARM_STACK_ANCHOR_X_COMP_LEVEL1_M",
+        os.getenv("QARM_STACK_HYDRATE_ANCHOR_X_COMP_LEVEL1_M", "0.000"),
+    )
+)
+STACK_ANCHOR_X_COMP_M = float(
+    os.getenv(
+        "QARM_STACK_ANCHOR_X_COMP_M",
+        os.getenv("QARM_STACK_HYDRATE_ANCHOR_X_COMP_M", "-0.005"),
+    )
+)
+# Legacy hydrate names remain aliases so older env overrides and imports still work.
+STACK_HYDRATE_ANCHOR_X_COMP_ENABLED = bool(STACK_ANCHOR_X_COMP_ENABLED)
+STACK_HYDRATE_ANCHOR_X_COMP_LEVEL1_M = float(STACK_ANCHOR_X_COMP_LEVEL1_M)
+STACK_HYDRATE_ANCHOR_X_COMP_M = float(STACK_ANCHOR_X_COMP_M)
 # Release XY opposite of grasp pick bias so cube center aligns with stack anchor (Z unchanged).
-PLACE_PICK_BIAS_COMPENSATE_ENABLED = _env_bool("QARM_PLACE_PICK_BIAS_COMPENSATE_ENABLED", True)
-PLACE_PICK_BIAS_COMPENSATE_SCALE = float(os.getenv("QARM_PLACE_PICK_BIAS_COMPENSATE_SCALE", "1"))
+PLACE_PICK_BIAS_COMPENSATE_ENABLED = _env_bool("QARM_PLACE_PICK_BIAS_COMPENSATE_ENABLED", False)
+PLACE_PICK_BIAS_COMPENSATE_SCALE = float(os.getenv("QARM_PLACE_PICK_BIAS_COMPENSATE_SCALE", "1.2"))
 PLACE_PICK_BIAS_COMPENSATE_STACK_ANCHOR_ENABLED = _env_bool(
     "QARM_PLACE_PICK_BIAS_COMPENSATE_STACK_ANCHOR_ENABLED",
     False,
@@ -764,7 +799,7 @@ STARTUP_STACK_CENTER_EY_SCALE = float(
     )
 )
 STARTUP_STACK_MAX_TRACK_ATTEMPTS = int(
-    os.getenv("QARM_STARTUP_STACK_MAX_TRACK_ATTEMPTS", "2")
+    os.getenv("QARM_STARTUP_STACK_MAX_TRACK_ATTEMPTS", "4")
 )
 STARTUP_STACK_VISIBILITY_DEFER_CHECKS = int(
     os.getenv("QARM_STARTUP_STACK_VISIBILITY_DEFER_CHECKS", "8")
@@ -772,6 +807,9 @@ STARTUP_STACK_VISIBILITY_DEFER_CHECKS = int(
 STARTUP_TARGET_MIN_CONF = float(os.getenv("QARM_STARTUP_TARGET_MIN_CONF", "0.70"))
 STARTUP_STACK_Z_PREDICT_ENABLED = _env_bool("QARM_STARTUP_STACK_Z_PREDICT_ENABLED", True)
 STARTUP_REFRESH_PASS_ENABLED = _env_bool("QARM_STARTUP_REFRESH_PASS_ENABLED", True)
+STARTUP_STACK_EXPECTED_LAYER_MIN_TOP_Z_M = float(
+    os.getenv("QARM_STARTUP_STACK_EXPECTED_LAYER_MIN_TOP_Z_M", "0.080")
+)
 STARTUP_STACK_LAYER_MATCH_XY_M = float(os.getenv("QARM_STARTUP_STACK_LAYER_MATCH_XY_M", "0.030"))
 STARTUP_STACK_LAYER_MATCH_Z_M = float(os.getenv("QARM_STARTUP_STACK_LAYER_MATCH_Z_M", "0.025"))
 STARTUP_STACK_LAYER_SCAN_FRAMES = int(os.getenv("QARM_STARTUP_STACK_LAYER_SCAN_FRAMES", "6"))
@@ -893,7 +931,14 @@ PLACE_VERIFY_V2_MIN_HITS = int(os.getenv("QARM_PLACE_VERIFY_V2_MIN_HITS", "4"))
 PLACE_VERIFY_V2_DELTA_MIN = float(os.getenv("QARM_PLACE_VERIFY_V2_DELTA_MIN", "0.10"))
 PLACE_VERIFY_V2_SETTLE_S = float(os.getenv("QARM_PLACE_VERIFY_V2_SETTLE_S", "0.20"))
 PLACE_VERIFY_V2_SLOT_SCAN_FIRST = _env_bool("QARM_PLACE_VERIFY_V2_SLOT_SCAN_FIRST", True)
-PLACE_VERIFY_V2_HYDRATE_FALLBACK_ENABLED = _env_bool("QARM_PLACE_VERIFY_V2_HYDRATE_FALLBACK_ENABLED", True)
+PLACE_VERIFY_V2_HYDRATE_FALLBACK_ENABLED = _env_bool("QARM_PLACE_VERIFY_V2_HYDRATE_FALLBACK_ENABLED", False)
+PLACE_VERIFY_V2_HIGHER_LAYER_REFRESH_ENABLED = _env_bool(
+    "QARM_PLACE_VERIFY_V2_HIGHER_LAYER_REFRESH_ENABLED",
+    True,
+)
+PLACE_VERIFY_V2_HIGHER_LAYER_XY_M = float(os.getenv("QARM_PLACE_VERIFY_V2_HIGHER_LAYER_XY_M", "0.030"))
+PLACE_VERIFY_V2_HIGHER_LAYER_MIN_DZ_M = float(os.getenv("QARM_PLACE_VERIFY_V2_HIGHER_LAYER_MIN_DZ_M", "0.030"))
+PLACE_VERIFY_V2_HIGHER_LAYER_MAX_DZ_M = float(os.getenv("QARM_PLACE_VERIFY_V2_HIGHER_LAYER_MAX_DZ_M", "0.140"))
 PLACE_VERIFY_V2_EXPECTED_SLOT_RETRIES = int(os.getenv("QARM_PLACE_VERIFY_V2_EXPECTED_SLOT_RETRIES", "1"))
 PLACE_VERIFY_V2_TOP_CANDIDATE_CHECKS = int(os.getenv("QARM_PLACE_VERIFY_V2_TOP_CANDIDATE_CHECKS", "2"))
 PLACE_VERIFY_V2_DEFER_GENERIC_HANDOFF_TO_HYDRATE = _env_bool(
@@ -902,7 +947,7 @@ PLACE_VERIFY_V2_DEFER_GENERIC_HANDOFF_TO_HYDRATE = _env_bool(
 )
 PLACE_VERIFY_V2_LADDER_LOGS = _env_bool("QARM_PLACE_VERIFY_V2_LADDER_LOGS", True)
 PLACE_VERIFY_V2_ACTIVE_CENTER_ON_WEAK = _env_bool("QARM_PLACE_VERIFY_V2_ACTIVE_CENTER_ON_WEAK", True)
-PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S = float(os.getenv("QARM_PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S", "2.5"))
+PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S = float(os.getenv("QARM_PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S", "3.5"))
 PLACE_VERIFY_V2_ALWAYS_RECENTER = _env_bool("QARM_PLACE_VERIFY_V2_ALWAYS_RECENTER", True)
 PLACE_VERIFY_V2_CUBE_EDGE_M = float(os.getenv("QARM_PLACE_VERIFY_V2_CUBE_EDGE_M", "0.060"))
 PLACE_VERIFY_V2_MIN_OVERLAP = float(os.getenv("QARM_PLACE_VERIFY_V2_MIN_OVERLAP", "0.65"))
@@ -979,7 +1024,7 @@ PLACE_VERIFY_V2_MIN_REJECTS_PER_SESSION = int(
     os.getenv("QARM_PLACE_VERIFY_V2_MIN_REJECTS_PER_SESSION", "8")
 )
 PLACE_VERIFY_V2_HARD_TIMEOUT_S = float(
-    os.getenv("QARM_PLACE_VERIFY_V2_HARD_TIMEOUT_S", "30.0")
+    os.getenv("QARM_PLACE_VERIFY_V2_HARD_TIMEOUT_S", "20.0")
 )
 TRACK_HANDOFF_NO_CANDIDATE_TIMEOUT_S = float(
     os.getenv("QARM_TRACK_HANDOFF_NO_CANDIDATE_TIMEOUT_S", "5.0")
@@ -1025,6 +1070,7 @@ TRACK_PICK_PREFER_TOP = _env_bool("QARM_TRACK_PICK_PREFER_TOP", True)
 TRACK_PICK_TOP_STRICT = _env_bool("QARM_TRACK_PICK_TOP_STRICT", True)
 TRACK_PICK_TOP_TIE_Z_M = float(os.getenv("QARM_TRACK_PICK_TOP_TIE_Z_M", "0.012"))
 PICK_TOP_EXPOSED_ONLY = _env_bool("QARM_PICK_TOP_EXPOSED_ONLY", True)
+OBSERVE_CENTER_CLOSEST_FIRST = _env_bool("QARM_OBSERVE_CENTER_CLOSEST_FIRST", True)
 PICK_TOP_EXPOSED_X_OVERLAP_MIN = float(os.getenv("QARM_PICK_TOP_EXPOSED_X_OVERLAP_MIN", "0.55"))
 PICK_TOP_EXPOSED_Y_GAP_PX = float(os.getenv("QARM_PICK_TOP_EXPOSED_Y_GAP_PX", "8.0"))
 _PICK_TOP_EXPOSED_FALLBACK_RAW = os.getenv("QARM_PICK_TOP_EXPOSED_FALLBACK", "closest").strip().lower()
@@ -1837,6 +1883,7 @@ def compute_stack_pick_x_offset(pick_xyz) -> tuple[float, dict]:
         "far_offset_m": float(STACK_PICK_X_OFFSET_FAR_M),
         "clamp_min_m": float(STACK_PICK_X_OFFSET_CLAMP_MIN_M),
         "clamp_max_m": float(STACK_PICK_X_OFFSET_CLAMP_MAX_M),
+        "allow_positive": bool(STACK_PICK_X_OFFSET_ALLOW_POSITIVE),
         "t": 0.0,
         "raw_offset_m": 0.0,
         "offset_m": 0.0,
@@ -1871,6 +1918,19 @@ def compute_stack_pick_x_offset(pick_xyz) -> tuple[float, dict]:
     clamp_min = min(float(STACK_PICK_X_OFFSET_CLAMP_MIN_M), float(STACK_PICK_X_OFFSET_CLAMP_MAX_M))
     clamp_max = max(float(STACK_PICK_X_OFFSET_CLAMP_MIN_M), float(STACK_PICK_X_OFFSET_CLAMP_MAX_M))
     dx = min(clamp_max, max(clamp_min, float(raw_dx)))
+    if float(dx) > 1e-9 and not bool(STACK_PICK_X_OFFSET_ALLOW_POSITIVE):
+        meta.update(
+            {
+                "applied": False,
+                "reason": "positive_x_offset_suppressed",
+                "pick_xyz": [float(pick_arr[0]), float(pick_arr[1]), float(pick_arr[2])],
+                "pick_x_m": float(pick_arr[0]),
+                "t": float(t),
+                "raw_offset_m": float(raw_dx),
+                "offset_m": 0.0,
+            }
+        )
+        return 0.0, meta
     meta.update(
         {
             "applied": abs(float(dx)) > 1e-9,
@@ -3306,6 +3366,8 @@ def log_startup_config(mode: str, safe_slots: list[np.ndarray] | None = None, se
         f"misplaced_extra=({float(PICK_MISPLACED_GRASP_X_OFFSET_M):+.3f},"
         f"{float(PICK_MISPLACED_GRASP_Y_OFFSET_M):+.3f},"
         f"{float(PICK_MISPLACED_GRASP_Z_OFFSET_M):+.3f}) m "
+        f"misplaced_x_per_level={float(PICK_MISPLACED_GRASP_X_PER_LEVEL_M):+.3f} "
+        f"x_cap_abs={float(PICK_MISPLACED_GRASP_X_MAX_ABS_M):.3f} "
         f"misplaced_y_per_level={float(PICK_MISPLACED_GRASP_Y_PER_LEVEL_M):+.3f} "
         f"cap={float(PICK_MISPLACED_GRASP_Y_MAX_M):+.3f}"
     )
@@ -3377,8 +3439,14 @@ def log_startup_config(mode: str, safe_slots: list[np.ndarray] | None = None, se
         f"(L1={float(STACK_X_LEVEL1_OFFSET):+.3f},L2={float(STACK_X_LEVEL2_OFFSET):+.3f}) "
         f"stack_pick_x_offset={bool(STACK_PICK_X_OFFSET_ENABLED)} "
         f"require_pick_x={bool(STACK_PICK_X_OFFSET_REQUIRE_PICK_X)} "
+        f"stack_anchor_x_comp={bool(STACK_ANCHOR_X_COMP_ENABLED)} "
+        f"anchor_x=(L1={float(STACK_ANCHOR_X_COMP_LEVEL1_M):+.3f},L2+={float(STACK_ANCHOR_X_COMP_M):+.3f}) "
         f"pick_x_range=({float(STACK_PICK_X_NEAR_M):.3f},{float(STACK_PICK_X_FAR_M):.3f}) "
         f"pick_x_dx=({float(STACK_PICK_X_OFFSET_NEAR_M):+.3f},{float(STACK_PICK_X_OFFSET_FAR_M):+.3f}) "
+        f"allow_positive_pick_x={bool(STACK_PICK_X_OFFSET_ALLOW_POSITIVE)} "
+        f"level2_extra_x={float(STACK_PICK_X_LEVEL2_EXTRA_M):+.3f} "
+        f"near_z_extra={float(STACK_PICK_X_NEAR_Z_EXTRA_M):+.3f} "
+        f"far_z_extra={float(STACK_PICK_X_FAR_Z_EXTRA_M):+.3f} "
         f"(delta=-pick_bias) z_unchanged=yes px_tol={int(PX_TOL)}"
     )
     print(
@@ -3404,7 +3472,8 @@ def log_startup_config(mode: str, safe_slots: list[np.ndarray] | None = None, se
         f"[Tracking] enabled={TRACK_ENABLE} match_xy={TRACK_MATCH_XY_M:.3f} m "
         f"max_miss={TRACK_MAX_MISS_FRAMES} min_conf={TRACK_MIN_CONF:.2f} "
         f"pick_top={TRACK_PICK_PREFER_TOP} strict_top={TRACK_PICK_TOP_STRICT} tie_z={TRACK_PICK_TOP_TIE_Z_M:.3f} "
-        f"exposed_only={PICK_TOP_EXPOSED_ONLY} x_overlap_min={PICK_TOP_EXPOSED_X_OVERLAP_MIN:.2f} "
+        f"exposed_only={PICK_TOP_EXPOSED_ONLY} observe_closest_first={OBSERVE_CENTER_CLOSEST_FIRST} "
+        f"x_overlap_min={PICK_TOP_EXPOSED_X_OVERLAP_MIN:.2f} "
         f"y_gap_px={PICK_TOP_EXPOSED_Y_GAP_PX:.1f} fallback={PICK_TOP_EXPOSED_FALLBACK} "
         f"tracker={YOLO_TRACKER} (hard_locked) persist={YOLO_TRACK_PERSIST} "
         f"ui_mode={UI_MODE} draw_all_boxes={UI_DRAW_ALL_BOXES} "
@@ -3546,6 +3615,7 @@ def log_startup_config(mode: str, safe_slots: list[np.ndarray] | None = None, se
             f"center_ey_scale={STARTUP_STACK_CENTER_EY_SCALE:.2f} | "
             f"target_min_conf={STARTUP_TARGET_MIN_CONF:.2f} | "
             f"z_predict_enabled={STARTUP_STACK_Z_PREDICT_ENABLED} | "
+            f"expected_layer_min_top_z={STARTUP_STACK_EXPECTED_LAYER_MIN_TOP_Z_M:.3f} | "
             f"refresh_pass_enabled={STARTUP_REFRESH_PASS_ENABLED} | "
             f"layer_scan_frames={STARTUP_STACK_LAYER_SCAN_FRAMES} "
             f"layer_vote_min_hits={STARTUP_STACK_LAYER_VOTE_MIN_HITS} "

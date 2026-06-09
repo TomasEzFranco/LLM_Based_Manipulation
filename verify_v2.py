@@ -502,6 +502,7 @@ def verify_last_place_reliability(
         max(1, int(PLACE_VERIFY_V2_MIN_REJECTS_PER_SESSION)),
     )
     hard_timeout_s = max(1.0, float(PLACE_VERIFY_V2_HARD_TIMEOUT_S))
+    verify_t0 = float(time.time())
     reject_count = 0
     selected_track_id: int | None = None
     last_score = {
@@ -546,6 +547,7 @@ def verify_last_place_reliability(
     verify_measurement_fallback_source = "not_run"
     expected_recenter_attempts: list[dict] = []
     top_candidate_attempts: list[dict] = []
+    higher_layer_rejects: list[dict] = []
     generic_handoff_deferred = False
     pending_stack_level = placement.get("pending_stack_level", None)
 
@@ -912,6 +914,63 @@ def verify_last_place_reliability(
             source=str(source),
         )
 
+    def _maybe_record_higher_layer_observation(track_id: int, selected_xyz: list[float] | None, source: str) -> None:
+        xyz = _finite_xyz_or_none(selected_xyz)
+        if xyz is None:
+            return
+        expected_eval = _finite_xyz_or_none(expected_for_score)
+        if expected_eval is None:
+            return
+        try:
+            xy_gate_m = max(0.0, float(PLACE_VERIFY_V2_HIGHER_LAYER_XY_M))
+            min_dz_m = max(0.0, float(PLACE_VERIFY_V2_HIGHER_LAYER_MIN_DZ_M))
+            max_dz_m = max(min_dz_m, float(PLACE_VERIFY_V2_HIGHER_LAYER_MAX_DZ_M))
+            dx_m = float(xyz[0]) - float(expected_eval[0])
+            dy_m = float(xyz[1]) - float(expected_eval[1])
+            d_xy_m = float(math.hypot(dx_m, dy_m))
+            dz_m = float(xyz[2]) - float(expected_eval[2])
+        except Exception:
+            return
+        if d_xy_m > xy_gate_m or dz_m < min_dz_m or dz_m > max_dz_m:
+            return
+        row = {
+            "track_id": int(track_id),
+            "source": str(source),
+            "selected_xyz": list(xyz),
+            "expected_xyz_eval": list(expected_eval),
+            "xy_error_m": float(d_xy_m),
+            "z_delta_m": float(dz_m),
+            "xy_gate_m": float(xy_gate_m),
+            "min_dz_m": float(min_dz_m),
+            "max_dz_m": float(max_dz_m),
+            "status": str(last_score.get("status", "")),
+        }
+        higher_layer_rejects.append(dict(row))
+        _ladder_log(
+            f"[PlaceVerifyHigherLayer] observed_reject source={source} track={int(track_id)} "
+            f"measured=({float(xyz[0]):.3f},{float(xyz[1]):.3f},{float(xyz[2]):.3f}) "
+            f"expected=({float(expected_eval[0]):.3f},{float(expected_eval[1]):.3f},{float(expected_eval[2]):.3f}) "
+            f"err_xy={float(d_xy_m):.3f} dz={float(dz_m):.3f}"
+        )
+
+    def _maybe_record_higher_layer_reject(track_id: int, selected_xyz: list[float] | None, source: str) -> None:
+        _maybe_record_higher_layer_observation(int(track_id), selected_xyz, str(source))
+
+    def _has_measured_higher_layer_reject() -> bool:
+        for row in list(higher_layer_rejects):
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source", "")).strip().lower()
+            if source == "generic_track_handoff" or source.endswith("_track_measure"):
+                return True
+        return False
+
+    def _verify_time_remaining_s() -> float:
+        return max(0.0, float(hard_timeout_s) - float(time.time() - verify_t0))
+
+    def _verify_hard_timeout_expired() -> bool:
+        return float(_verify_time_remaining_s()) <= 0.0
+
     def _side_pixel_ok(u_px: int, img_cx: int) -> bool:
         section_name = str(expected_section or "").strip().lower()
         if not bool(PLACE_VERIFY_V2_SECTION_PIXEL_GATE):
@@ -992,6 +1051,9 @@ def verify_last_place_reliability(
             row["d2_px"] = float((int(u) - int(cx_now)) ** 2 + (int(v) - int(cy_now)) ** 2)
             row["color_name"] = str(color_name)
             row["color_conf"] = float(color_conf)
+            xyz = _resolve_candidate_xyz(obs_now, row)
+            if xyz is not None:
+                row["xyz"] = list(xyz)
             rows.append(row)
         rows.sort(
             key=lambda row: (
@@ -1003,7 +1065,14 @@ def verify_last_place_reliability(
         return rows[:limit_i]
 
     def _run_expected_recenter_attempt(attempt_i: int, total_attempts: int) -> bool:
-        nonlocal active_center_used, selected_track_id
+        nonlocal active_center_used, selected_track_id, loop_exit_reason
+        timeout_budget_s = min(
+            float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+            float(_verify_time_remaining_s()),
+        )
+        if float(timeout_budget_s) <= 0.0:
+            loop_exit_reason = "hard_timeout"
+            return False
         source = "filtered_center" if int(attempt_i) <= 0 else f"filtered_center_retry_{int(attempt_i)}"
         _ladder_log(
             f"[PlaceVerifyRetry] attempt={int(attempt_i) + 1}/{int(total_attempts)} "
@@ -1016,7 +1085,7 @@ def verify_last_place_reliability(
             arm=arm,
             per=per,
             expected_xyz=expected_for_score,
-            timeout_s=float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+            timeout_s=float(timeout_budget_s),
             required_centered_frames=3,
             min_conf=float(center_min_conf),
             radius_m=max(float(PLACE_VERIFY_V2_RADIUS_M), float(PLACE_VERIFY_RADIUS_M)),
@@ -1028,10 +1097,10 @@ def verify_last_place_reliability(
             state=state,
             blocked_track_ids_seed=verify_blocked_track_ids,
             use_pixel_blacklist=False,
-            target_mode_override="filtered_first",
+            target_mode_override=PLACE_VERIFY_V2_TARGET_MODE,
             apply_lock_wrong_xy_gate=False,
             use_projected_xyz_for_filter=False,
-            no_target_timeout_s=float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+            no_target_timeout_s=float(timeout_budget_s),
             reset_timeout_on_first_candidate=True,
         )
         attempt_row = {
@@ -1091,7 +1160,7 @@ def verify_last_place_reliability(
         return bool(confirmed)
 
     def _run_top_side_candidate_checks() -> bool:
-        nonlocal selected_track_id
+        nonlocal selected_track_id, loop_exit_reason, verify_measurement_fallback_source
         candidates = _collect_top_side_track_candidates(int(PLACE_VERIFY_V2_TOP_CANDIDATE_CHECKS))
         if not candidates:
             _ladder_log(
@@ -1101,20 +1170,33 @@ def verify_last_place_reliability(
             return False
         total = len(candidates)
         for idx, candidate in enumerate(candidates, start=1):
+            timeout_budget_s = min(
+                float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+                float(_verify_time_remaining_s()),
+            )
+            if float(timeout_budget_s) <= 0.0:
+                loop_exit_reason = "hard_timeout"
+                return False
             tid = int(candidate.get("track_id"))
             _ladder_log(
                 f"[PlaceVerifyTop2] candidate_i={idx}/{total} track={tid} "
                 f"uv=({int(candidate.get('u', 0))},{int(candidate.get('v', 0))}) "
                 f"conf={float(candidate.get('conf', 0.0)):.3f} "
                 f"color={candidate.get('color_name', 'unknown')} "
-                f"color_conf={float(candidate.get('color_conf', 0.0)):.3f}"
+                f"color_conf={float(candidate.get('color_conf', 0.0)):.3f} "
+                f"center_color_filter=off expected_color={expected_color or 'unknown'}"
+            )
+            _maybe_record_higher_layer_observation(
+                int(tid),
+                _finite_xyz_or_none(candidate.get("xyz", None)),
+                f"top_side_candidate_{int(idx)}_precenter",
             )
             centered_uv = center_object_on_expected_slot(
                 det=det,
                 arm=arm,
                 per=per,
                 expected_xyz=expected_for_score,
-                timeout_s=float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+                timeout_s=float(timeout_budget_s),
                 required_centered_frames=3,
                 min_conf=float(min(DETECT_CONF, PLACE_VERIFY_MIN_CONF)),
                 radius_m=max(float(PLACE_VERIFY_V2_RADIUS_M), float(PLACE_VERIFY_RADIUS_M)),
@@ -1122,14 +1204,14 @@ def verify_last_place_reliability(
                 stack_level=int(stack_level),
                 min_z_m=stack_min_z_m,
                 expected_section=expected_section,
-                expected_color=expected_color,
+                expected_color=None,
                 state=state,
                 blocked_track_ids_seed=verify_blocked_track_ids,
                 use_pixel_blacklist=False,
                 target_mode_override="top_first",
                 apply_lock_wrong_xy_gate=False,
                 use_projected_xyz_for_filter=False,
-                no_target_timeout_s=float(PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S),
+                no_target_timeout_s=float(timeout_budget_s),
                 reset_timeout_on_first_candidate=True,
                 preferred_track_id=int(tid),
                 strict_track_lock=True,
@@ -1145,10 +1227,19 @@ def verify_last_place_reliability(
                 top_candidate_attempts.append(dict(row))
                 continue
             selected_track_id = int(tid)
+            score_source = f"top_side_candidate_{int(idx)}_track_measure"
+            higher_reject_count_before_score = len(higher_layer_rejects)
             confirmed = _score_locked_track_id(
                 int(tid),
-                source=f"top_side_candidate_{int(idx)}_track_measure",
+                source=str(score_source),
             )
+            score_ran = str(verify_measurement_fallback_source) == str(score_source)
+            if bool(score_ran) and str(last_score.get("status", "")) == "placed_mismatch_out_of_margin":
+                _maybe_record_higher_layer_reject(
+                    int(tid),
+                    _finite_xyz_or_none(measured_xyz),
+                    str(score_source),
+                )
             row["status"] = str(last_score.get("status", "unknown"))
             row["measured_xyz"] = _finite_xyz_or_none(measured_xyz)
             row["xy_error_m"] = float(last_score.get("xy_error_m", float("inf")))
@@ -1161,6 +1252,19 @@ def verify_last_place_reliability(
             )
             if bool(confirmed):
                 return True
+            if (
+                bool(score_ran)
+                and pending_stack_level is not None
+                and len(higher_layer_rejects) > int(higher_reject_count_before_score)
+            ):
+                loop_exit_reason = "defer_higher_layer_hydrate"
+                verify_measurement_fallback_source = "top_side_higher_layer_scan"
+                _ladder_log(
+                    f"[PlaceVerifyHigherLayer] early_defer source={score_source} "
+                    f"section={expected_section or 'unknown'} pending_level={pending_stack_level} "
+                    f"status={last_score.get('status')}"
+                )
+                return False
             verify_blocked_track_ids.add(int(tid))
         return False
 
@@ -1315,15 +1419,20 @@ def verify_last_place_reliability(
     if (
         not bool(last_score.get("confirmed", False))
         and bool(PLACE_VERIFY_V2_ACTIVE_CENTER_ON_WEAK or PLACE_VERIFY_V2_ALWAYS_RECENTER)
+        and not bool(_verify_hard_timeout_expired())
     ):
         recenter_total = 1 + max(0, int(PLACE_VERIFY_V2_EXPECTED_SLOT_RETRIES))
         for attempt_i in range(int(recenter_total)):
             if _run_expected_recenter_attempt(int(attempt_i), int(recenter_total)):
                 break
+            if bool(_verify_hard_timeout_expired()):
+                loop_exit_reason = "hard_timeout"
+                break
 
     if (
         not bool(last_score.get("confirmed", False))
         and int(PLACE_VERIFY_V2_TOP_CANDIDATE_CHECKS) > 0
+        and not bool(_verify_hard_timeout_expired())
     ):
         _run_top_side_candidate_checks()
 
@@ -1353,6 +1462,11 @@ def verify_last_place_reliability(
                 "exit_reason": "confirmed",
             }
         if str(last_score.get("status", "")) == "placed_mismatch_out_of_margin":
+            _maybe_record_higher_layer_reject(
+                int(track_id),
+                _finite_xyz_or_none(measured_xyz),
+                "generic_track_handoff",
+            )
             return {
                 "decision": "reject",
                 "reason": "placed_mismatch_out_of_margin",
@@ -1381,18 +1495,46 @@ def verify_last_place_reliability(
             f"pending_level={pending_stack_level} status={last_score.get('status')}"
         )
 
-    if not bool(last_score.get("confirmed", False)) and not bool(generic_handoff_deferred):
+    if (
+        not bool(last_score.get("confirmed", False))
+        and not bool(generic_handoff_deferred)
+        and pending_stack_level is not None
+        and _has_measured_higher_layer_reject()
+    ):
+        generic_handoff_deferred = True
+        loop_exit_reason = "defer_higher_layer_hydrate"
+        verify_measurement_fallback_source = "top_side_higher_layer_scan"
+        _ladder_log(
+            f"[PlaceVerifyGenericHandoff] deferred_to_higher_layer_hydrate "
+            f"section={expected_section or 'unknown'} pending_level={pending_stack_level} "
+            f"status={last_score.get('status')}"
+        )
+
+    if (
+        not bool(last_score.get("confirmed", False))
+        and not bool(generic_handoff_deferred)
+        and bool(_verify_hard_timeout_expired())
+    ):
+        loop_exit_reason = "hard_timeout"
+        verify_measurement_fallback_source = "hard_timeout"
+
+    if (
+        not bool(last_score.get("confirmed", False))
+        and not bool(generic_handoff_deferred)
+        and not bool(_verify_hard_timeout_expired())
+    ):
         _ladder_log(
             f"[PlaceVerifyGenericHandoff] begin reason=expected_ladder_failed "
             f"section={expected_section or 'unknown'} status={last_score.get('status')}"
         )
+        remaining_handoff_s = max(0.1, float(_verify_time_remaining_s()))
         session = run_track_handoff_session(
             state=state,
             arm=arm,
             per=per,
             det=det,
             reject_cap=int(max_rejects),
-            hard_timeout_s=float(hard_timeout_s),
+            hard_timeout_s=float(remaining_handoff_s),
             xy_margin_m=float(xy_margin_m),
             z_margin_m=float(z_margin_m),
             blocked_track_id=None,
@@ -1470,8 +1612,13 @@ def verify_last_place_reliability(
         "verify_blocked_track_ids": sorted([int(tid) for tid in verify_blocked_track_ids]),
         "verify_reject_count": int(reject_count),
         "verify_max_rejects": int(max_rejects),
+        "verify_hard_timeout_s": float(hard_timeout_s),
+        "verify_elapsed_s": float(time.time() - verify_t0),
+        "verify_hard_timeout_expired": bool(_verify_hard_timeout_expired()),
         "verify_expected_recenter_attempts": list(expected_recenter_attempts),
         "verify_top_candidate_attempts": list(top_candidate_attempts),
+        "verify_higher_layer_reject_seen": bool(higher_layer_rejects),
+        "verify_higher_layer_rejects": list(higher_layer_rejects),
         "verify_generic_handoff_deferred": bool(generic_handoff_deferred),
         "verify_selected_track_id": (None if selected_track_id is None else int(selected_track_id)),
         "verify_exit_reason": str(loop_exit_reason),

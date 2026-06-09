@@ -6,11 +6,11 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name, "1" if default else "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 # --- Visual centering controller ---
-KYAW = 0.0016  # yaw gain (rad/pixel)
-KSHOULDER = float(os.getenv("QARM_CENTER_KSHOULDER", "0.0003"))  # shoulder gain (rad/pixel)
-KELBOW = float(os.getenv("QARM_CENTER_KELBOW", "0.001"))  # elbow gain (rad/pixel)
+KYAW = 0.0015  # yaw gain (rad/pixel)
+KSHOULDER = float(os.getenv("QARM_CENTER_KSHOULDER", "0.0006"))  # shoulder gain (rad/pixel)
+KELBOW = float(os.getenv("QARM_CENTER_KELBOW", "0.0009"))  # elbow gain (rad/pixel)
 # Small integral on ey to counter static bias/gravity/friction near center.
-CENTER_EY_KI = float(os.getenv("QARM_CENTER_EY_KI", "0.0001"))  # shoulder rad / (pixel*frame)
+CENTER_EY_KI = float(os.getenv("QARM_CENTER_EY_KI", "0.0000"))  # shoulder rad / (pixel*frame)
 CENTER_EY_KI_ELBOW = float(os.getenv("QARM_CENTER_EY_KI_ELBOW", "0.0003"))  # elbow rad / (pixel*frame)
 CENTER_EY_I_CLAMP = float(os.getenv("QARM_CENTER_EY_I_CLAMP", "100"))  # pixel*frame accumulator clamp
 CENTER_EY_I_DECAY = float(os.getenv("QARM_CENTER_EY_I_DECAY", "0.85"))  # leakage to avoid windup carryover

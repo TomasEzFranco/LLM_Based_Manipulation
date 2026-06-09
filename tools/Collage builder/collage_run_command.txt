@@ -1,0 +1,1 @@
+python tools\build_policy_collage.py --manifest "C:\Users\tofranco\OneDrive - Cal Poly\FrancoTomas Master's Research Project\RESULTS\Logs and Photos\Parser for raw_output for each prompt\policy_collage_manifest_all_prompts_ready.csv" --output-dir results\policy_collage_final --title "Policy Photo Collage"

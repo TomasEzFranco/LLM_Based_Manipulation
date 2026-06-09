@@ -375,7 +375,6 @@ def main_prompted():
                     observe_fail_streak=int(observe_fail_streak),
                     observe_fail_stop_after=int(OBSERVE_FAIL_STOP_AFTER),
                     record_policy_step=record_policy_step,
-                    capture_pick_lock_snapshot_fn=capture_pick_lock_snapshot,
                 )
 
             def run_pick_other_action(command_for_history: str):
@@ -392,7 +391,6 @@ def main_prompted():
                     place_verify_v2_min_hits=max(1, int(PLACE_VERIFY_V2_MIN_HITS)),
                     pick_other_validate_samples=int(PICK_OTHER_VALIDATE_SAMPLES),
                     record_policy_step=record_policy_step,
-                    capture_pick_lock_snapshot_fn=capture_pick_lock_snapshot,
                 )
 
             while True:

@@ -39,6 +39,7 @@ def acquire_and_center_intended_cube(
     blocked_track_ids = set() if blocked_track_ids is None else {int(x) for x in blocked_track_ids}
     blocked_xyzs = [] if blocked_xyzs is None else [list(x) for x in blocked_xyzs if isinstance(x, (list, tuple)) and len(x) >= 3]
     blocked_uvs = [] if blocked_uvs is None else [list(x) for x in blocked_uvs if isinstance(x, (list, tuple)) and len(x) >= 2]
+
     # Prime track memory with one frame before active centering.
     if TRACK_ENABLE:
         obs0 = observe_scene_frame(
@@ -61,6 +62,8 @@ def acquire_and_center_intended_cube(
             blocked_track_ids=blocked_track_ids,
             blocked_xyzs=blocked_xyzs,
         )
+        if bool(OBSERVE_CENTER_CLOSEST_FIRST):
+            target_track_id = None
     else:
         target_track_id = None
 
@@ -74,6 +77,15 @@ def acquire_and_center_intended_cube(
 
     def _selector(candidates: list[dict], view_cx: int, view_cy: int, context: dict) -> dict | None:
         target_tid = context.get("target_track_id", None)
+        observe_session_lock = bool(context.get("observe_session_lock", False))
+        if observe_session_lock:
+            session_tid = context.get("observe_session_track_id", None)
+            if session_tid is not None:
+                try:
+                    target_tid = int(session_tid)
+                except (TypeError, ValueError):
+                    context["observe_session_track_id"] = None
+                    target_tid = None
         blocked_ids = context.get("blocked_track_ids", set())
         if not isinstance(blocked_ids, set):
             try:
@@ -165,7 +177,7 @@ def acquire_and_center_intended_cube(
                 require_track_id=bool(TRACK_ENABLE),
                 blocked_track_ids=effective_blocked_ids,
                 blocked_uvs=blocked_uv_rows,
-                top_exposed_only=bool(PICK_TOP_EXPOSED_ONLY),
+                top_exposed_only=bool(PICK_TOP_EXPOSED_ONLY and not OBSERVE_CENTER_CLOSEST_FIRST),
                 x_overlap_min=float(PICK_TOP_EXPOSED_X_OVERLAP_MIN),
                 y_gap_px=float(PICK_TOP_EXPOSED_Y_GAP_PX),
                 fallback_mode=str(PICK_TOP_EXPOSED_FALLBACK),
@@ -174,41 +186,80 @@ def acquire_and_center_intended_cube(
             meta["xyz_blocked_ids"] = sorted([int(tid) for tid in xyz_blocked_ids])
             return selected, meta
 
-        # For stacked scenes, always re-evaluate top-exposed candidates each frame.
-        # This avoids sticky lock behavior on lower cubes when a higher cube is visible.
-        if bool(PICK_TOP_EXPOSED_ONLY):
+        def _set_session_wait_meta(tid: int, reason: str) -> None:
+            context["selector_meta"] = {
+                "selector_mode": f"observe_session_track_wait:{reason}",
+                "candidate_count": int(len(candidates)),
+                "conf_considered": 0,
+                "eligible_count": 0,
+                "exposed_top_count": 0,
+                "fallback_used": False,
+                "selected_track_id": int(tid),
+                "selected_uv": context.get("observe_session_uv", None),
+            }
+
+        # Closest-first only chooses the initial target; hold it for this observe attempt.
+        if bool(OBSERVE_CENTER_CLOSEST_FIRST):
+            if not (observe_session_lock and target_tid is not None):
+                target_tid = None
+        elif bool(PICK_TOP_EXPOSED_ONLY):
             target_tid = None
 
         if target_tid is not None and TRACK_ENABLE:
             if int(target_tid) in blocked_ids:
+                if observe_session_lock:
+                    _set_session_wait_meta(int(target_tid), "blocked_track")
+                    return None
                 target_tid = None
             else:
                 target_row = state.track_memory.get(int(target_tid), None) if state.track_memory else None
                 if _is_track_xyz_blocked(target_row):
+                    if observe_session_lock:
+                        _set_session_wait_meta(int(target_tid), "blocked_xyz")
+                        return None
                     target_tid = None
                 else:
                     locked = _find_track_candidate(candidates, int(target_tid))
                     if locked is not None:
+                        locked_uv = [int(locked.get("u", 0)), int(locked.get("v", 0))]
+                        if observe_session_lock:
+                            context["observe_session_uv"] = list(locked_uv)
                         context["selector_meta"] = {
-                            "selector_mode": "track_lock",
+                            "selector_mode": (
+                                "observe_session_track_lock" if observe_session_lock else "track_lock"
+                            ),
                             "candidate_count": int(len(candidates)),
                             "conf_considered": 0,
                             "eligible_count": 1,
                             "exposed_top_count": 1,
                             "fallback_used": False,
                             "selected_track_id": int(locked.get("track_id")),
-                            "selected_uv": [int(locked.get("u", 0)), int(locked.get("v", 0))],
+                            "selected_uv": list(locked_uv),
                         }
                         return locked
+                    if observe_session_lock:
+                        _set_session_wait_meta(int(target_tid), "track_not_visible")
+                        return None
         ranked, selector_meta = _select_stack_top_candidate(candidates)
-        context["selector_meta"] = dict(selector_meta or {})
         if ranked is None:
+            context["selector_meta"] = dict(selector_meta or {})
             return None
         ranked_tid = _candidate_track_id_or_none(ranked)
         if TRACK_ENABLE and ranked_tid is not None and state.track_memory:
             ranked_row = state.track_memory.get(int(ranked_tid), None)
             if _is_track_xyz_blocked(ranked_row):
+                context["selector_meta"] = dict(selector_meta or {})
                 return None
+        if observe_session_lock and ranked_tid is not None:
+            ranked_uv = [int(ranked.get("u", 0)), int(ranked.get("v", 0))]
+            context["observe_session_track_id"] = int(ranked_tid)
+            context["observe_session_uv"] = list(ranked_uv)
+            selector_meta = dict(selector_meta or {})
+            selector_meta["selector_mode"] = f"{selector_meta.get('selector_mode', 'closest')}_session_lock"
+            selector_meta["selected_track_id"] = int(ranked_tid)
+            selector_meta["selected_uv"] = list(ranked_uv)
+            selector_meta["session_locked_track_id"] = int(ranked_tid)
+        context["selector_meta"] = dict(selector_meta or {})
         return ranked
 
     centered_pos = center_object_slowly(
@@ -221,7 +272,11 @@ def acquire_and_center_intended_cube(
         save_tag=f"{label_prefix}_{state.cycle_count:03d}",
         save_annotated=LOCALIZATION_CAPTURE_SAVE_ANNOTATED,
         candidate_selector=_selector,
-        selector_context={"target_track_id": target_track_id, "blocked_track_ids": blocked_track_ids},
+        selector_context={
+            "target_track_id": target_track_id,
+            "blocked_track_ids": blocked_track_ids,
+            "observe_session_lock": bool(OBSERVE_CENTER_CLOSEST_FIRST and TRACK_ENABLE),
+        },
         state=state,
     )
     if centered_pos is None:

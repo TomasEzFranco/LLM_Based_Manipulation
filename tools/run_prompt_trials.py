@@ -127,6 +127,9 @@ CSV_FIELDS = [
     "video_file",
     "steps_completed_auto",
     "steps_required_auto",
+    "completion_scoring",
+    "target_left_stack",
+    "target_right_stack",
     "completion_ratio_auto",
     "failure_stage_auto",
     "failure_source_auto",
@@ -264,6 +267,13 @@ def load_prompt_file(path: Path) -> tuple[list[dict[str, Any]], int]:
             raise SystemExit(f"ERROR: duplicate prompt id: {prompt_id}")
         if not prompt_text:
             raise SystemExit(f"ERROR: prompt {prompt_id} is missing text")
+        completion_scoring = str(row.get("completion_scoring", "")).strip()
+        target_left_stack = str(row.get("target_left_stack", "")).strip().upper()
+        target_right_stack = str(row.get("target_right_stack", "")).strip().upper()
+        if completion_scoring and completion_scoring != "final_stack":
+            raise SystemExit(f"ERROR: prompt {prompt_id} has unknown completion_scoring={completion_scoring!r}")
+        if completion_scoring == "final_stack" and not (target_left_stack or target_right_stack):
+            raise SystemExit(f"ERROR: prompt {prompt_id} uses final_stack scoring without target stack metadata")
         steps_raw = row.get("steps_required", row.get("steps_required_default", ""))
         steps_required: int | str
         if str(steps_raw).strip() == "":
@@ -283,6 +293,9 @@ def load_prompt_file(path: Path) -> tuple[list[dict[str, Any]], int]:
                 "initial_condition": initial_condition,
                 "steps_required_default": steps_required,
                 "prompt_index": idx,
+                "completion_scoring": completion_scoring,
+                "target_left_stack": target_left_stack,
+                "target_right_stack": target_right_stack,
             }
         )
     return normalized, max(1, int(default_repeats))
@@ -309,6 +322,9 @@ def build_trial_plan(
                     "prompt_text": prompt["text"],
                     "prompt_initial_condition": prompt.get("initial_condition", ""),
                     "steps_required_default": prompt["steps_required_default"],
+                    "completion_scoring": prompt.get("completion_scoring", ""),
+                    "target_left_stack": prompt.get("target_left_stack", ""),
+                    "target_right_stack": prompt.get("target_right_stack", ""),
                     "trial_dir": trial_dir,
                 }
             )
@@ -859,7 +875,39 @@ def resolve_steps_required_auto(
     )
 
 
-def infer_steps_completed_auto(metrics: dict[str, Any], steps_required: str = "") -> str:
+def stack_slot_match_count(actual: str, target: str) -> int:
+    actual_norm = str(actual or "").strip().upper()
+    target_norm = str(target or "").strip().upper()
+    return sum(
+        1
+        for idx, target_color in enumerate(target_norm)
+        if idx < len(actual_norm) and actual_norm[idx] == target_color
+    )
+
+
+def infer_final_stack_steps_completed(metrics: dict[str, Any], trial: dict[str, Any]) -> str:
+    target_left = str(trial.get("target_left_stack", "")).strip().upper()
+    target_right = str(trial.get("target_right_stack", "")).strip().upper()
+    if not target_left and not target_right:
+        return "manual_required"
+    final_left = str(metrics.get("final_left_stack", "")).strip().upper()
+    final_right = str(metrics.get("final_right_stack", "")).strip().upper()
+    if not final_left and not final_right:
+        return "manual_required"
+    return str(
+        stack_slot_match_count(final_left, target_left)
+        + stack_slot_match_count(final_right, target_right)
+    )
+
+
+def infer_steps_completed_auto(
+    metrics: dict[str, Any],
+    steps_required: str = "",
+    *,
+    trial: dict[str, Any] | None = None,
+) -> str:
+    if trial is not None and str(trial.get("completion_scoring", "")).strip().lower() == "final_stack":
+        return infer_final_stack_steps_completed(metrics, trial)
     action_score = parse_int(str(metrics.get("num_place", "0"))) + parse_int(str(metrics.get("num_pick_misplaced", "0")))
     if is_positive_int(steps_required) and action_score > 0:
         return str(min(action_score, int(steps_required)))
@@ -918,7 +966,7 @@ def build_auto_fields(
         trial=trial,
         initial_condition=initial_condition,
     )
-    steps_completed = infer_steps_completed_auto(metrics, steps_required)
+    steps_completed = infer_steps_completed_auto(metrics, steps_required, trial=trial)
     ratio = "manual_required"
     if steps_completed.isdigit() and steps_required.isdigit() and int(steps_required) > 0:
         ratio = completion_ratio(int(steps_completed), int(steps_required))
@@ -1214,6 +1262,9 @@ def make_row(
         "prompt_text": trial["prompt_text"],
         "prompt_initial_condition": str(trial.get("prompt_initial_condition", "")),
         "initial_condition": initial_condition,
+        "completion_scoring": str(trial.get("completion_scoring", "")),
+        "target_left_stack": str(trial.get("target_left_stack", "")),
+        "target_right_stack": str(trial.get("target_right_stack", "")),
         "console_log": str((Path(trial["trial_dir"]) / "console_log.txt").resolve()),
         "policy_trace_dir": str(Path(trial["trial_dir"]).resolve()),
     }
@@ -1384,6 +1435,9 @@ def launch_trial(
             "repeat_index": int(trial["repeat_index"]),
             "prompt_text": trial["prompt_text"],
             "steps_required_default": trial["steps_required_default"],
+            "completion_scoring": str(trial.get("completion_scoring", "")),
+            "target_left_stack": str(trial.get("target_left_stack", "")),
+            "target_right_stack": str(trial.get("target_right_stack", "")),
             "prompt_initial_condition": str(trial.get("prompt_initial_condition", "")),
             "initial_condition": str(initial_condition),
             "started_at": started_at,
@@ -1501,11 +1555,13 @@ def describe_pick_inventory(text: str) -> str:
     text = str(text).strip().upper()
     if not text:
         return "empty"
-    parts = re.findall(r"([BO])\s*(\d*)", text)
+    parts = re.findall(r"(?:(\d+)\s*([BO])|([BO])\s*(\d*))", text)
     if not parts:
         return text
     labels: list[str] = []
-    for color, count_raw in parts:
+    for count_prefix, prefix_color, suffix_color, count_suffix in parts:
+        color = prefix_color or suffix_color
+        count_raw = count_prefix or count_suffix
         count = int(count_raw) if count_raw else 1
         labels.append(f"{count} {color_name(color)}")
     return ", ".join(labels)
@@ -1554,6 +1610,10 @@ def abort_trial_before_run(
             "prompt_index": int(trial["prompt_index"]),
             "repeat_index": int(trial["repeat_index"]),
             "prompt_text": trial["prompt_text"],
+            "steps_required_default": trial["steps_required_default"],
+            "completion_scoring": str(trial.get("completion_scoring", "")),
+            "target_left_stack": str(trial.get("target_left_stack", "")),
+            "target_right_stack": str(trial.get("target_right_stack", "")),
             "prompt_initial_condition": str(trial.get("prompt_initial_condition", "")),
             "started_at": started_at,
             "ended_at": ended_at,
@@ -1682,6 +1742,9 @@ def finalize_orphaned_running_trials(
             "prompt_text": str(meta.get("prompt_text", "")),
             "prompt_initial_condition": str(meta.get("prompt_initial_condition", "")),
             "steps_required_default": meta.get("steps_required_default", ""),
+            "completion_scoring": str(meta.get("completion_scoring", "")),
+            "target_left_stack": str(meta.get("target_left_stack", "")),
+            "target_right_stack": str(meta.get("target_right_stack", "")),
             "trial_dir": meta_path.parent,
         }
         started_at = str(meta.get("started_at", "") or "")

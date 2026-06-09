@@ -616,7 +616,18 @@ def build_prompted_planner_state(
             level_hint = int(max(0, stack_levels.get(str(section_name).strip().lower(), 0)))
         except Exception:
             level_hint = 0
-        return _planner_section_row_unified(state, section_name, stack_level_hint=level_hint)
+        internal_row = _planner_section_row_unified(state, section_name, stack_level_hint=level_hint)
+        try:
+            cube_count = int(max(0, internal_row.get("stack_level", 0) or 0))
+        except Exception:
+            cube_count = 0
+        out = {
+            "cube_count": int(cube_count),
+            "slots": dict(internal_row.get("slots", {})),
+        }
+        if "color_sequence_bottom_to_top" in internal_row:
+            out["color_sequence_bottom_to_top"] = list(internal_row.get("color_sequence_bottom_to_top", []))
+        return out
 
     _ = (picked_count, placed_count, last_feedback)  # runtime-only tracking, not planner payload
     holding = bool(holding_object)

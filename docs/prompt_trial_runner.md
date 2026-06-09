@@ -16,14 +16,14 @@ python tools/run_prompt_trials.py --session thesis_trials_01
 python tools/run_prompt_trials.py --resume results/thesis_trials_01
 python tools/run_prompt_trials.py --resume results/thesis_trials_01 --delete-trials 11,12,13-15
 python tools/run_prompt_trials.py --prompts experiments/prompts.json
-python tools/run_prompt_trials.py --prompt-id P1 --repeats 2
+python tools/run_prompt_trials.py --prompt-id prompt_1_color_split --repeats 2
 python tools/run_prompt_trials.py --python .\.venv312\Scripts\python.exe
 python tools/run_prompt_trials.py --dry-run
 ```
 
-Default collection is 30 trials: 3 prompts x 10 repeats. Trial order is
-interleaved by repeat so prompt comparisons are less sensitive to drift:
-`P1 r1, P2 r1, P3 r1, P1 r2, ...`.
+Default collection is 40 trials: 4 prompts x 10 repeats. Trial order is
+grouped by prompt:
+`P1 r1, P1 r2, ..., P2 r1, ...`.
 
 ## Operator Flow
 
@@ -36,9 +36,11 @@ Use compact initial-condition notation such as:
 
 ```text
 L=BOB;R=;P=B3O3
+L=BOB;R=B;P=2O
 ```
 
 `L` and `R` are bottom-to-top stack sequences. `P` is pick-space inventory.
+Pick-space counts may be written before or after the color (`2O` or `O2`).
 Each prompt in `experiments/prompts.json` can define `initial_condition`. The
 runner shows that setup before launch and uses it as the default when there is
 no previous value for that prompt. Press Enter on the initial-condition prompt
@@ -95,6 +97,11 @@ trial, last initial condition per prompt, CSV paths, and the session folder.
 tasks, `steps_completed_auto` counts place actions plus placed-cube correction
 picks, capped at `steps_required_auto`.
 
+Prompts may set `completion_scoring: "final_stack"` with `target_left_stack`
+and/or `target_right_stack`. Those prompts score only final matching stack slots
+from the last parsed `[StackState]` / `[PlannerStack]` row, which is useful for
+interruption tests where extra correction actions should not inflate completion.
+
 The subprocess environment is:
 
 - `QARM_MISSION_PROMPT`: selected prompt text.
@@ -132,16 +139,15 @@ Use these columns for common thesis plots:
 
 Edit `experiments/prompts.json` to change trial mission text (mirrored in
 `runtime_core._MISSION_PROMPT_P*` constants). Keep each mission's final
-`stop_run` line unchanged when tuning clarity. Keep exactly three prompt objects when comparing the
-planned prompt set, and keep unique `id` values so resumed sessions can skip
-already recorded trial ids cleanly.
+`stop_run` line unchanged when tuning clarity. Keep unique `id` values so
+resumed sessions can skip already recorded trial ids cleanly.
 
 ## Validation
 
 ```powershell
 python -m py_compile tools/run_prompt_trials.py
 python tools/run_prompt_trials.py --dry-run --repeats 1
-python tools/run_prompt_trials.py --dry-run --prompt-id P1 --repeats 2
+python tools/run_prompt_trials.py --dry-run --prompt-id prompt_1_color_split --repeats 2
 ```
 
 Dry run prints the planned trial layout and does not launch

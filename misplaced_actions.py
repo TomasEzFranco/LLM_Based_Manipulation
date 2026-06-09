@@ -3001,29 +3001,40 @@ def execute_pick_misplaced_cube_action(
         f"mult=1.40 trigger=GRASP_STACK_FORWARD_ENABLE "
         f"trigger_enabled={bool(GRASP_STACK_FORWARD_ENABLE)}"
     )
-    correction_extra_x = float(PICK_MISPLACED_GRASP_X_OFFSET_M)
     height_gate_for_offset = lock_info.get("height_gate", {}) if isinstance(lock_info, dict) else {}
     try:
-        correction_level_for_y = int(height_gate_for_offset.get("selected_level", 0) or 0)
+        correction_level_for_offset = int(height_gate_for_offset.get("selected_level", 0) or 0)
     except Exception:
-        correction_level_for_y = 0
-    correction_level_for_y = max(0, min(int(MAX_STACK_LEVELS_PER_SECTION), int(correction_level_for_y)))
-    z_high_extra = float(PICK_MISPLACED_GRASP_HIGH_Z_EXTRA_M) if int(correction_level_for_y) > 0 else 0.0
+        correction_level_for_offset = 0
+    correction_level_for_offset = max(0, min(int(MAX_STACK_LEVELS_PER_SECTION), int(correction_level_for_offset)))
+    x_level_steps = max(0, int(correction_level_for_offset) - 1)
+    x_dynamic = float(x_level_steps) * float(PICK_MISPLACED_GRASP_X_PER_LEVEL_M)
+    x_cap_abs = max(0.0, float(PICK_MISPLACED_GRASP_X_MAX_ABS_M))
+    x_dynamic = float(max(-float(x_cap_abs), min(float(x_cap_abs), float(x_dynamic))))
+    correction_extra_x = float(PICK_MISPLACED_GRASP_X_OFFSET_M) + float(x_dynamic)
+    z_high_extra = float(PICK_MISPLACED_GRASP_HIGH_Z_EXTRA_M) if int(correction_level_for_offset) > 0 else 0.0
     correction_extra_z = float(PICK_MISPLACED_GRASP_Z_OFFSET_M) + float(z_high_extra)
-    y_dynamic = float(correction_level_for_y) * float(PICK_MISPLACED_GRASP_Y_PER_LEVEL_M)
+    y_dynamic = float(correction_level_for_offset) * float(PICK_MISPLACED_GRASP_Y_PER_LEVEL_M)
     y_cap = max(0.0, float(PICK_MISPLACED_GRASP_Y_MAX_M))
     y_dynamic = float(max(0.0, min(float(y_cap), float(y_dynamic))))
     correction_extra_y = float(PICK_MISPLACED_GRASP_Y_OFFSET_M) + float(y_dynamic)
     context_base["correction_grasp_extra_x_m"] = float(correction_extra_x)
+    context_base["correction_grasp_x_level_delta_m"] = float(x_dynamic)
+    context_base["correction_grasp_x_level"] = int(correction_level_for_offset)
+    context_base["correction_grasp_x_level_steps"] = int(x_level_steps)
     context_base["correction_grasp_extra_y_m"] = float(correction_extra_y)
-    context_base["correction_grasp_y_level"] = int(correction_level_for_y)
+    context_base["correction_grasp_y_level"] = int(correction_level_for_offset)
     context_base["correction_grasp_extra_z_m"] = float(correction_extra_z)
     print(
         f"[PickMisplacedGraspOffset] extra_x={float(correction_extra_x):+.3f} "
+        f"(base={float(PICK_MISPLACED_GRASP_X_OFFSET_M):+.3f}, "
+        f"per_level={float(PICK_MISPLACED_GRASP_X_PER_LEVEL_M):+.3f}, "
+        f"level={int(correction_level_for_offset)}, steps={int(x_level_steps)}, "
+        f"cap_abs={float(x_cap_abs):.3f}) "
         f"extra_y={float(correction_extra_y):+.3f} "
         f"(base={float(PICK_MISPLACED_GRASP_Y_OFFSET_M):+.3f}, "
         f"per_level={float(PICK_MISPLACED_GRASP_Y_PER_LEVEL_M):+.3f}, "
-        f"level={int(correction_level_for_y)}, cap={float(y_cap):+.3f}) "
+        f"level={int(correction_level_for_offset)}, cap={float(y_cap):+.3f}) "
         f"extra_z={float(correction_extra_z):+.3f} "
         f"(base={float(PICK_MISPLACED_GRASP_Z_OFFSET_M):+.3f}, "
         f"high_extra={float(z_high_extra):+.3f})"

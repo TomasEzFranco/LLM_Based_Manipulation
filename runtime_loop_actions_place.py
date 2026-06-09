@@ -86,6 +86,153 @@ def _coerce_xyz_for_place_verify(value) -> list[float] | None:
     return [float(x), float(y), float(z)]
 
 
+def _verify_v2_const(name: str, default):
+    try:
+        if not bool(getattr(verify_v2, "_CORE_BIND_READY", False)):
+            bind = getattr(verify_v2, "_bind_core_globals", None)
+            if callable(bind):
+                bind()
+    except Exception:
+        pass
+    return getattr(verify_v2, str(name), default)
+
+
+def _place_verify_authoritative_state_already_applied(place_verify: dict | None) -> bool:
+    row = place_verify if isinstance(place_verify, dict) else {}
+    return str(row.get("authoritative_state_source", "")).strip().lower() == "higher_layer_scoped_hydrate"
+
+
+def _should_skip_remeasure_after_higher_layer_hydrate_reject(place_verify: dict | None) -> bool:
+    row = place_verify if isinstance(place_verify, dict) else {}
+    if str(row.get("status", "")).strip().lower() != "expected_layer_scanned_higher_than_expected":
+        return False
+    hydrate = row.get("higher_layer_hydrate", {})
+    if not isinstance(hydrate, dict):
+        return False
+    reason = str(hydrate.get("reason", "")).strip().lower()
+    if reason == "unresolved_visible_tracks":
+        return True
+    external = row.get("external_manipulation", {})
+    external_type = str((external if isinstance(external, dict) else {}).get("type", "")).strip().lower()
+    return bool(row.get("requires_recovery", False)) and external_type == "higher_layer_occlusion"
+
+
+def _classify_place_verify_higher_layer_scan(
+    *,
+    place_verify: dict,
+    section: str,
+    pending_stack_level: int | None,
+) -> dict:
+    if not bool(_verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_REFRESH_ENABLED", True)):
+        return {"detected": False, "reason": "disabled"}
+    section_norm = str(section or "").strip().lower()
+    if section_norm not in {"left", "right"}:
+        return {"detected": False, "reason": "invalid_section", "section": section_norm}
+    if pending_stack_level is None:
+        return {"detected": False, "reason": "missing_pending_level", "section": section_norm}
+    try:
+        pending_i = int(pending_stack_level)
+    except Exception:
+        return {"detected": False, "reason": "invalid_pending_level", "section": section_norm}
+    if int(pending_i) <= 0:
+        return {"detected": False, "reason": "invalid_pending_level", "section": section_norm}
+    higher_rejects = [
+        dict(row)
+        for row in list((place_verify or {}).get("verify_higher_layer_rejects", []) or [])
+        if isinstance(row, dict)
+    ]
+    if higher_rejects:
+        row = dict(higher_rejects[0])
+        measured = _coerce_xyz_for_place_verify(row.get("selected_xyz", row.get("measured_xyz", None)))
+        expected = _coerce_xyz_for_place_verify(row.get("expected_xyz_eval", None))
+        if measured is not None and expected is not None:
+            return {
+                "detected": True,
+                "reason": "expected_layer_scanned_higher_than_expected",
+                "source": "verify_higher_layer_reject",
+                "section": section_norm,
+                "pending_level": int(pending_i),
+                "expected_xyz_eval": list(expected),
+                "measured_xyz": list(measured),
+                "xy_error_m": float(row.get("xy_error_m", float("inf"))),
+                "z_delta_m": float(row.get("z_delta_m", float("inf"))),
+                "xy_gate_m": float(row.get("xy_gate_m", _verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_XY_M", 0.030))),
+                "min_dz_m": float(row.get("min_dz_m", _verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_MIN_DZ_M", 0.030))),
+                "max_dz_m": float(row.get("max_dz_m", _verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_MAX_DZ_M", 0.140))),
+                "track_id": row.get("track_id", None),
+                "original_status": str((place_verify or {}).get("status", "")),
+                "original_confirmed": bool((place_verify or {}).get("confirmed", False)),
+            }
+    if bool((place_verify or {}).get("confirmed", False)):
+        return {"detected": False, "reason": "already_confirmed", "section": section_norm}
+    measured = _coerce_xyz_for_place_verify((place_verify or {}).get("measured_xyz", None))
+    if measured is None:
+        return {"detected": False, "reason": "missing_measured_xyz", "section": section_norm}
+    expected = _coerce_xyz_for_place_verify((place_verify or {}).get("expected_xyz_eval", None))
+    if expected is None:
+        expected = _coerce_xyz_for_place_verify((place_verify or {}).get("expected_xyz", None))
+    if expected is None:
+        return {"detected": False, "reason": "missing_expected_xyz", "section": section_norm}
+
+    dx_m = float(measured[0]) - float(expected[0])
+    dy_m = float(measured[1]) - float(expected[1])
+    d_xy_m = float(math.hypot(dx_m, dy_m))
+    dz_m = float(measured[2]) - float(expected[2])
+    xy_gate_m = max(0.0, float(_verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_XY_M", 0.030)))
+    min_dz_m = max(0.0, float(_verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_MIN_DZ_M", 0.030)))
+    max_dz_m = max(min_dz_m, float(_verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_MAX_DZ_M", 0.140)))
+    if d_xy_m > xy_gate_m:
+        return {
+            "detected": False,
+            "reason": "xy_out_of_gate",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "xy_error_m": float(d_xy_m),
+            "z_delta_m": float(dz_m),
+            "xy_gate_m": float(xy_gate_m),
+            "min_dz_m": float(min_dz_m),
+            "max_dz_m": float(max_dz_m),
+        }
+    if dz_m < min_dz_m:
+        return {
+            "detected": False,
+            "reason": "z_not_higher_than_expected",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "xy_error_m": float(d_xy_m),
+            "z_delta_m": float(dz_m),
+            "xy_gate_m": float(xy_gate_m),
+            "min_dz_m": float(min_dz_m),
+            "max_dz_m": float(max_dz_m),
+        }
+    if dz_m > max_dz_m:
+        return {
+            "detected": False,
+            "reason": "z_delta_too_large",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "xy_error_m": float(d_xy_m),
+            "z_delta_m": float(dz_m),
+            "xy_gate_m": float(xy_gate_m),
+            "min_dz_m": float(min_dz_m),
+            "max_dz_m": float(max_dz_m),
+        }
+    return {
+        "detected": True,
+        "reason": "expected_layer_scanned_higher_than_expected",
+        "section": section_norm,
+        "pending_level": int(pending_i),
+        "expected_xyz_eval": list(expected),
+        "measured_xyz": list(measured),
+        "xy_error_m": float(d_xy_m),
+        "z_delta_m": float(dz_m),
+        "xy_gate_m": float(xy_gate_m),
+        "min_dz_m": float(min_dz_m),
+        "max_dz_m": float(max_dz_m),
+        "original_status": str((place_verify or {}).get("status", "")),
+    }
+
+
 def _evaluate_place_verify_hydrate_fallback(
     *,
     startup_boot_row: dict | None,
@@ -232,6 +379,401 @@ def _evaluate_place_verify_hydrate_fallback(
         "xy_margin_m": float(xy_margin_m),
         "z_margin_m": float(z_margin_m),
     }
+
+
+def _evaluate_place_verify_higher_layer_hydrate(
+    *,
+    startup_boot_row: dict | None,
+    section: str,
+    pending_stack_level: int | None,
+    expected_color: str | None,
+    place_verify: dict,
+) -> dict:
+    section_norm = str(section or "").strip().lower()
+    if section_norm not in {"left", "right"}:
+        return {"accepted": False, "reason": "invalid_section", "section": section_norm}
+    if pending_stack_level is None:
+        return {"accepted": False, "reason": "missing_pending_level", "section": section_norm}
+    try:
+        pending_i = int(pending_stack_level)
+    except Exception:
+        return {"accepted": False, "reason": "invalid_pending_level", "section": section_norm}
+    if int(pending_i) <= 0:
+        return {"accepted": False, "reason": "invalid_pending_level", "section": section_norm}
+    if not isinstance(startup_boot_row, dict):
+        return {"accepted": False, "reason": "missing_startup_row", "section": section_norm}
+
+    hydration_status = str(startup_boot_row.get("hydration_status", "")).strip().lower()
+    if hydration_status not in {"ok", "partial", "preserved_authoritative"}:
+        return {
+            "accepted": False,
+            "reason": f"hydration_status:{hydration_status or 'unknown'}",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+        }
+    unresolved = list(startup_boot_row.get("hydration_unresolved_visible_track_ids", []) or [])
+
+    hydrated = startup_boot_row.get("hydrated_stacks", {})
+    sections = hydrated.get("sections", {}) if isinstance(hydrated, dict) else {}
+    row_raw = sections.get(section_norm, {}) if isinstance(sections, dict) else {}
+    row = stack_scene._normalize_hydrated_section_row(row_raw)
+    level_i = int(row.get("stack_level", 0) or 0)
+    observed_extra_layers = max(0, int(level_i) - int(pending_i))
+    if level_i < pending_i:
+        return {
+            "accepted": False,
+            "reason": "level_below_pending",
+            "section": section_norm,
+            "hydrated_level": int(level_i),
+            "pending_level": int(pending_i),
+            "observed_extra_layers": int(observed_extra_layers),
+        }
+
+    seq = [
+        str(c).strip().lower()
+        for c in list(row.get("color_sequence_bottom_to_top", []))
+        if str(c).strip().lower() in {"orange", "blue", "unknown"}
+    ]
+    layer_idx = int(pending_i - 1)
+    layer_color = str(seq[layer_idx]).strip().lower() if layer_idx < len(seq) else "unknown"
+    expected_color_norm = str(expected_color or "").strip().lower()
+    if expected_color_norm in {"orange", "blue"} and layer_color in {"orange", "blue"}:
+        if layer_color != expected_color_norm:
+            return {
+                "accepted": False,
+                "reason": "color_mismatch",
+                "section": section_norm,
+                "pending_level": int(pending_i),
+                "hydrated_level": int(level_i),
+                "observed_extra_layers": int(observed_extra_layers),
+                "expected_color": expected_color_norm,
+                "hydrated_color": layer_color,
+            }
+
+    entries = [dict(e) for e in list(row.get("entries", [])) if isinstance(e, dict)]
+    entry = entries[layer_idx] if layer_idx < len(entries) else None
+    entry_xyz = _coerce_xyz_for_place_verify((entry or {}).get("xyz", None))
+    if entry_xyz is None:
+        return {
+            "accepted": False,
+            "reason": "missing_layer_xyz",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "hydrated_level": int(level_i),
+            "observed_extra_layers": int(observed_extra_layers),
+        }
+    expected_eval = _coerce_xyz_for_place_verify(place_verify.get("expected_xyz_eval", None))
+    if expected_eval is None:
+        expected_eval = _coerce_xyz_for_place_verify(place_verify.get("expected_xyz", None))
+    if expected_eval is None:
+        return {"accepted": False, "reason": "missing_expected_xyz", "section": section_norm}
+
+    xy_margin_m = max(0.0, float(_verify_v2_const("PLACE_VERIFY_V2_HIGHER_LAYER_XY_M", 0.030)))
+    try:
+        z_margin_m = float(place_verify.get("effective_z_margin_m", float("nan")))
+    except Exception:
+        z_margin_m = float("nan")
+    if not math.isfinite(z_margin_m):
+        z_margin_m = 0.0
+    z_margin_m = max(z_margin_m, float(getattr(stack_scene, "STARTUP_STACK_LAYER_MATCH_Z_M", 0.025)))
+    dx_m = float(entry_xyz[0]) - float(expected_eval[0])
+    dy_m = float(entry_xyz[1]) - float(expected_eval[1])
+    d_xy_m = float(math.hypot(dx_m, dy_m))
+    d_z_m = float(abs(float(entry_xyz[2]) - float(expected_eval[2])))
+    missing_sides = {
+        str(side).strip().lower()
+        for side in list(startup_boot_row.get("hydration_missing_sides", []) or [])
+        if str(side).strip().lower() in {"left", "right"}
+    }
+    shortfall_sides = {
+        str(side).strip().lower()
+        for side in list(startup_boot_row.get("hydration_expected_shortfall_sides", []) or [])
+        if str(side).strip().lower() in {"left", "right"}
+    }
+    expected_levels = (
+        hydrated.get("expected_stack_levels", {})
+        if isinstance(hydrated, dict)
+        else {}
+    )
+    observed_levels = (
+        hydrated.get("observed_stack_levels", {})
+        if isinstance(hydrated, dict)
+        else {}
+    )
+    try:
+        expected_level_i = int(expected_levels.get(section_norm, level_i) or 0)
+    except Exception:
+        expected_level_i = int(level_i)
+    try:
+        observed_level_i = int(observed_levels.get(section_norm, level_i) or 0)
+    except Exception:
+        observed_level_i = int(level_i)
+    has_summary_levels = (
+        isinstance(expected_levels, dict)
+        and isinstance(observed_levels, dict)
+        and section_norm in expected_levels
+        and section_norm in observed_levels
+    )
+    section_complete = (
+        hydration_status == "ok"
+        and has_summary_levels
+        and section_norm not in missing_sides
+        and section_norm not in shortfall_sides
+        and int(observed_extra_layers) > 0
+        and int(observed_level_i) == int(level_i)
+        and int(expected_level_i) <= int(level_i)
+        and len(seq) >= int(level_i)
+        and len(entries) >= int(level_i)
+        and all(
+            _coerce_xyz_for_place_verify(entries[idx].get("xyz", None)) is not None
+            for idx in range(max(0, int(level_i)))
+        )
+    )
+    if section_complete:
+        return {
+            "accepted": True,
+            "reason": "complete_hydrate_authoritative_after_higher_layer",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "hydrated_level": int(level_i),
+            "expected_level": int(expected_level_i),
+            "observed_extra_layers": int(observed_extra_layers),
+            "layer_index": int(layer_idx),
+            "measured_xyz": list(entry_xyz),
+            "expected_xyz_eval": list(expected_eval),
+            "measured_color": str(layer_color),
+            "xy_error_m": float(d_xy_m),
+            "z_error_m": float(d_z_m),
+            "dx_m": float(dx_m),
+            "dy_m": float(dy_m),
+            "xy_margin_m": float(xy_margin_m),
+            "z_margin_m": float(z_margin_m),
+            "geometry_gate_skipped": True,
+            "unresolved_visible_track_ids": list(unresolved),
+            "unresolved_visible_tracks_ignored_for_scoped_apply": bool(unresolved),
+        }
+    if d_xy_m > xy_margin_m:
+        return {
+            "accepted": False,
+            "reason": "xy_out_of_margin",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "hydrated_level": int(level_i),
+            "observed_extra_layers": int(observed_extra_layers),
+            "measured_xyz": list(entry_xyz),
+            "expected_xyz_eval": list(expected_eval),
+            "xy_error_m": float(d_xy_m),
+            "z_error_m": float(d_z_m),
+            "xy_margin_m": float(xy_margin_m),
+            "z_margin_m": float(z_margin_m),
+        }
+    if d_z_m > z_margin_m:
+        return {
+            "accepted": False,
+            "reason": "z_out_of_margin",
+            "section": section_norm,
+            "pending_level": int(pending_i),
+            "hydrated_level": int(level_i),
+            "observed_extra_layers": int(observed_extra_layers),
+            "measured_xyz": list(entry_xyz),
+            "expected_xyz_eval": list(expected_eval),
+            "xy_error_m": float(d_xy_m),
+            "z_error_m": float(d_z_m),
+            "xy_margin_m": float(xy_margin_m),
+            "z_margin_m": float(z_margin_m),
+        }
+    return {
+        "accepted": True,
+        "reason": "ok",
+        "section": section_norm,
+        "pending_level": int(pending_i),
+        "hydrated_level": int(level_i),
+        "observed_extra_layers": int(observed_extra_layers),
+        "layer_index": int(layer_idx),
+        "measured_xyz": list(entry_xyz),
+        "expected_xyz_eval": list(expected_eval),
+        "measured_color": str(layer_color),
+        "xy_error_m": float(d_xy_m),
+        "z_error_m": float(d_z_m),
+        "dx_m": float(dx_m),
+        "dy_m": float(dy_m),
+        "xy_margin_m": float(xy_margin_m),
+        "z_margin_m": float(z_margin_m),
+        "unresolved_visible_track_ids": list(unresolved),
+        "unresolved_visible_tracks_ignored_for_scoped_apply": bool(unresolved),
+    }
+
+
+def _try_place_verify_higher_layer_refresh(
+    *,
+    place_verify: dict,
+    state,
+    run_startup_stack_bootstrap_verify,
+    section: str,
+    pending_stack_level: int | None,
+    expected_color: str | None,
+) -> dict:
+    candidate = _classify_place_verify_higher_layer_scan(
+        place_verify=place_verify,
+        section=section,
+        pending_stack_level=pending_stack_level,
+    )
+    if not bool(candidate.get("detected", False)):
+        return dict(place_verify)
+    print(
+        f"[PlaceVerifyHigherLayer] candidate section={candidate.get('section')} "
+        f"pending={candidate.get('pending_level')} measured={_fmt_xyz_for_log(candidate.get('measured_xyz'))} "
+        f"expected={_fmt_xyz_for_log(candidate.get('expected_xyz_eval'))} "
+        f"err_xy={float(candidate.get('xy_error_m', float('inf'))):.3f} "
+        f"dz={float(candidate.get('z_delta_m', float('inf'))):.3f}"
+    )
+    print(
+        f"[PlaceVerifyHigherLayerHydrate] begin section={section} "
+        f"pending_level={pending_stack_level} status={place_verify.get('status')}"
+    )
+    try:
+        startup_boot = run_startup_stack_bootstrap_verify(mode="refresh")
+    except Exception as exc:
+        out = dict(place_verify)
+        out["status"] = "expected_layer_scanned_higher_than_expected"
+        out["confirmed"] = False
+        out["higher_layer_scan"] = dict(candidate)
+        out["higher_layer_hydrate"] = {
+            "accepted": False,
+            "reason": f"exception:{type(exc).__name__}",
+            "error": str(exc),
+        }
+        out["requires_recovery"] = True
+        out["recovery_reason"] = "expected_layer_occluded_by_higher_than_expected"
+        print(
+            f"[PlaceVerifyHigherLayerHydrate] rejected reason=exception:{type(exc).__name__} "
+            f"error={exc}"
+        )
+        return out
+
+    evaluation = _evaluate_place_verify_higher_layer_hydrate(
+        startup_boot_row=startup_boot,
+        section=section,
+        pending_stack_level=pending_stack_level,
+        expected_color=expected_color,
+        place_verify=place_verify,
+    )
+    if not bool(evaluation.get("accepted", False)):
+        out = dict(place_verify)
+        out["status"] = "expected_layer_scanned_higher_than_expected"
+        out["confirmed"] = False
+        out["higher_layer_scan"] = dict(candidate)
+        out["higher_layer_hydrate"] = dict(evaluation)
+        out["requires_recovery"] = True
+        out["recovery_reason"] = "expected_layer_occluded_by_higher_than_expected"
+        out["external_manipulation"] = {
+            "type": "higher_layer_occlusion",
+            "confirmed": False,
+            "action": "block_for_correction",
+            "scan": dict(candidate),
+            "hydrate": dict(evaluation),
+        }
+        state.last_place_verification = dict(out)
+        state.last_place_verification_v2 = dict(out)
+        if state.placed_ledger:
+            state.placed_ledger[-1]["verify_result"] = dict(out)
+        print(
+            f"[PlaceVerifyHigherLayerHydrate] rejected section={section} "
+            f"pending_level={pending_stack_level} reason={evaluation.get('reason')}"
+        )
+        print(
+            f"[ExternalManipulationDetected] side={section} pending={pending_stack_level} "
+            f"hydrated_level={evaluation.get('hydrated_level')} action=block_for_correction"
+        )
+        return out
+
+    apply_result = stack_scene.apply_startup_stack_hydration_for_section(
+        state,
+        startup_boot,
+        str(section),
+    )
+    if not bool(apply_result.get("changed", False)):
+        out = dict(place_verify)
+        out["status"] = "expected_layer_scanned_higher_than_expected"
+        out["confirmed"] = False
+        out["higher_layer_scan"] = dict(candidate)
+        out["higher_layer_hydrate"] = dict(evaluation)
+        out["authoritative_apply"] = dict(apply_result)
+        out["requires_recovery"] = True
+        out["recovery_reason"] = "expected_layer_occluded_by_higher_than_expected"
+        print(
+            f"[PlaceVerifyHigherLayerHydrate] rejected section={section} "
+            f"pending_level={pending_stack_level} reason=authoritative_apply:{apply_result.get('reason')}"
+        )
+        print(
+            f"[ExternalManipulationDetected] side={section} pending={pending_stack_level} "
+            f"hydrated_level={evaluation.get('hydrated_level')} action=block_for_correction"
+        )
+        return out
+
+    if bool(evaluation.get("unresolved_visible_tracks_ignored_for_scoped_apply", False)):
+        print(
+            "[PlaceVerifyHigherLayerHydrate] unresolved_ignored_for_scoped_apply "
+            f"section={section} unresolved={evaluation.get('unresolved_visible_track_ids')} "
+            "reason=placed_side_validated"
+        )
+
+    out = dict(place_verify)
+    out["status"] = "placed_confirmed_expected_layer_scanned_higher_than_expected"
+    out["confirmed"] = True
+    out["measured_xyz"] = list(evaluation.get("measured_xyz", []))
+    measured_color = str(evaluation.get("measured_color", "unknown")).strip().lower()
+    if measured_color in {"orange", "blue"}:
+        out["measured_color"] = str(measured_color)
+        out["measured_color_conf"] = max(float(out.get("measured_color_conf", 0.0) or 0.0), 1.0)
+        out["measured_color_hits"] = max(int(out.get("measured_color_hits", 0) or 0), 1)
+        out["measured_color_source"] = "startup_hydrate"
+    out["xy_error_m"] = float(evaluation.get("xy_error_m", out.get("xy_error_m", float("inf"))))
+    out["z_error_m"] = float(evaluation.get("z_error_m", out.get("z_error_m", float("inf"))))
+    out["dx_m"] = float(evaluation.get("dx_m", out.get("dx_m", float("inf"))))
+    out["dy_m"] = float(evaluation.get("dy_m", out.get("dy_m", float("inf"))))
+    out["effective_xy_margin_m"] = float(evaluation.get("xy_margin_m", out.get("effective_xy_margin_m", float("nan"))))
+    out["effective_z_margin_m"] = float(evaluation.get("z_margin_m", out.get("effective_z_margin_m", float("nan"))))
+    out["verify_exit_reason"] = "higher_layer_hydrate_confirmed"
+    out["verify_measurement_fallback_source"] = "higher_layer_startup_hydrate_refresh"
+    out["higher_layer_scan"] = dict(candidate)
+    out["higher_layer_hydrate"] = dict(evaluation)
+    out["authoritative_apply"] = dict(apply_result)
+    out["authoritative_state_source"] = "higher_layer_scoped_hydrate"
+    out["external_manipulation"] = {
+        "type": "higher_layer_occlusion",
+        "confirmed": True,
+        "action": "side_hydrate_applied",
+        "scan": dict(candidate),
+        "hydrate": dict(evaluation),
+    }
+    state.last_place_verification = dict(out)
+    state.last_place_verification_v2 = dict(out)
+    if state.placed_ledger:
+        placement = state.placed_ledger[-1]
+        placement["verify_result"] = dict(out)
+        if bool(placement.get("verify_counted", False)):
+            try:
+                state.place_verify_uncertain_count = max(0, int(state.place_verify_uncertain_count) - 1)
+            except Exception:
+                pass
+            try:
+                state.place_verify_confirmed_count = int(state.place_verify_confirmed_count) + 1
+            except Exception:
+                pass
+    print(
+        f"[PlaceVerifyHigherLayerHydrate] accepted section={section} "
+        f"reason={evaluation.get('reason')} "
+        f"pending_level={pending_stack_level} hydrated_level={evaluation.get('hydrated_level')} "
+        f"extra_layers={evaluation.get('observed_extra_layers')} measured={_fmt_xyz_for_log(out.get('measured_xyz'))} "
+        f"err_xy={float(out.get('xy_error_m', float('inf'))):.3f} "
+        f"err_z={float(out.get('z_error_m', float('inf'))):.3f}"
+    )
+    print(
+        f"[ExternalManipulationDetected] side={section} pending={pending_stack_level} "
+        f"hydrated_level={evaluation.get('hydrated_level')} action=side_hydrate_applied"
+    )
+    return out
 
 
 def _try_place_verify_hydrate_fallback(
@@ -471,7 +1013,27 @@ def handle_place_action(
         if (
             pending_stack_level is not None
             and ledger_section in {section_left_name, section_right_name}
+            and (
+                (not bool(place_verify.get("confirmed", False)))
+                or bool(place_verify.get("verify_higher_layer_reject_seen", False))
+            )
+        ):
+            expected_color_for_higher_layer = str(cube_color).strip().lower()
+            if expected_color_for_higher_layer not in {"orange", "blue"}:
+                expected_color_for_higher_layer = str(place_verify.get("expected_color", "")).strip().lower()
+            place_verify = _try_place_verify_higher_layer_refresh(
+                place_verify=place_verify,
+                state=state,
+                run_startup_stack_bootstrap_verify=run_startup_stack_bootstrap_verify,
+                section=str(ledger_section),
+                pending_stack_level=pending_stack_level,
+                expected_color=expected_color_for_higher_layer,
+            )
+        if (
+            pending_stack_level is not None
+            and ledger_section in {section_left_name, section_right_name}
             and not bool(place_verify.get("confirmed", False))
+            and str(place_verify.get("status", "")).strip().lower() != "expected_layer_scanned_higher_than_expected"
         ):
             expected_color_for_hydrate = str(cube_color).strip().lower()
             if expected_color_for_hydrate not in {"orange", "blue"}:
@@ -513,34 +1075,50 @@ def handle_place_action(
                 )
             else:
                 remeasure_meta: dict = {"status": "skipped"}
-                remeasured_xyz, remeasure_meta = stack_scene.remeasure_stack_xyz_until_stable(
-                    arm=arm,
-                    per=per,
-                    det=det,
-                    expected_xyz=place_verify.get("expected_xyz", None),
-                    pending_stack_level=pending_stack_level,
-                    section_name=ledger_section,
-                    expected_color=(
-                        None
-                        if str(place_verify.get("expected_color", "")).strip().lower() in {"", "none", "unknown"}
-                        else str(place_verify.get("expected_color", "")).strip().lower()
-                    ),
-                    state=state,
-                )
-                if remeasured_xyz is not None:
-                    measured_xyz = remeasured_xyz
                 current_layers = int(stack_levels.get(ledger_section, 0))
-                if measured_xyz is None:
-                    # No measurement means weak evidence; keep current stack level to avoid
-                    # dropping target Z to table height and colliding through an existing stack.
+                if _should_skip_remeasure_after_higher_layer_hydrate_reject(place_verify):
+                    hydrate = place_verify.get("higher_layer_hydrate", {})
+                    hydrate_reason = str(
+                        (hydrate if isinstance(hydrate, dict) else {}).get("reason", "reject")
+                    ).strip().lower() or "reject"
+                    remeasure_meta = {
+                        "status": f"skipped_higher_layer_hydrate_{hydrate_reason}",
+                        "valid": 0,
+                    }
                     inferred_layers = int(current_layers)
-                else:
-                    inferred_layers = stack_scene.infer_stack_layers_from_measurement(
-                        measured_xyz=measured_xyz,
-                        expected_xyz=place_verify.get("expected_xyz", None),
-                        slot_used=slot_used,
-                        current_layers=current_layers,
+                    hold_reason = f"higher_layer_hydrate_{hydrate_reason}"
+                    print(
+                        "[PlaceVerifyHigherLayer] skip_remeasure "
+                        f"reason=hydrate_{hydrate_reason}"
                     )
+                else:
+                    remeasured_xyz, remeasure_meta = stack_scene.remeasure_stack_xyz_until_stable(
+                        arm=arm,
+                        per=per,
+                        det=det,
+                        expected_xyz=place_verify.get("expected_xyz", None),
+                        pending_stack_level=pending_stack_level,
+                        section_name=ledger_section,
+                        expected_color=(
+                            None
+                            if str(place_verify.get("expected_color", "")).strip().lower() in {"", "none", "unknown"}
+                            else str(place_verify.get("expected_color", "")).strip().lower()
+                        ),
+                        state=state,
+                    )
+                    if remeasured_xyz is not None:
+                        measured_xyz = remeasured_xyz
+                    if measured_xyz is None:
+                        # No measurement means weak evidence; keep current stack level to avoid
+                        # dropping target Z to table height and colliding through an existing stack.
+                        inferred_layers = int(current_layers)
+                    else:
+                        inferred_layers = stack_scene.infer_stack_layers_from_measurement(
+                            measured_xyz=measured_xyz,
+                            expected_xyz=place_verify.get("expected_xyz", None),
+                            slot_used=slot_used,
+                            current_layers=current_layers,
+                        )
                 if int(inferred_layers) < int(current_layers):
                     verify_status = str(place_verify.get("status", "")).strip().lower()
                     remeasure_status = str(remeasure_meta.get("status", "")).strip().lower()
@@ -578,17 +1156,28 @@ def handle_place_action(
         placement_confirmed = bool(place_verify.get("confirmed", False))
         auth_place_update = None
         if placement_confirmed:
-            placed_color = str(cube_color).strip().lower()
+            verified_ledger_color = "unknown"
+            if state.placed_ledger:
+                try:
+                    verified_ledger_color = str(state.placed_ledger[-1].get("cube_color", "unknown")).strip().lower()
+                except Exception:
+                    verified_ledger_color = "unknown"
+            placed_color = str(verified_ledger_color).strip().lower()
+            if placed_color not in {"orange", "blue"}:
+                placed_color = str(cube_color).strip().lower()
             if placed_color not in {"orange", "blue"}:
                 verify_color = str(place_verify.get("measured_color", "unknown")).strip().lower()
                 if verify_color in {"orange", "blue"}:
                     placed_color = str(verify_color)
             if ledger_section in {section_left_name, section_right_name}:
-                auth_place_update = stack_scene.append_authoritative_stack_cube(
-                    state=state,
-                    section_name=ledger_section,
-                    cube_color=str(placed_color),
-                )
+                if _place_verify_authoritative_state_already_applied(place_verify):
+                    auth_place_update = dict(place_verify.get("authoritative_apply", {}) or {})
+                else:
+                    auth_place_update = stack_scene.append_authoritative_stack_cube(
+                        state=state,
+                        section_name=ledger_section,
+                        cube_color=str(placed_color),
+                    )
                 sync_stack_levels_from_authoritative_state()
             state.placed_count += 1
             state.cycles_without_place_progress = 0
@@ -611,7 +1200,8 @@ def handle_place_action(
                 and pending_stack_level is not None
             ):
                 place_verify["requires_recovery"] = True
-                place_verify["recovery_reason"] = "unconfirmed_pending_stack"
+                if not str(place_verify.get("recovery_reason", "")).strip():
+                    place_verify["recovery_reason"] = "unconfirmed_pending_stack"
                 state.last_place_verification = dict(place_verify)
                 if state.placed_ledger:
                     try:

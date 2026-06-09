@@ -17,15 +17,19 @@ Rules:
 9. If one stack is complete and the other is incomplete, do not choose stop_run.
 10. Treat section_status and holding_object as current truth.
 11. If your expectation conflicts with state, trust state and refresh (observe/classify).
-12. After pick_other, trust the current `pick_target` in state; classify if color is unknown, or grasp if known and mission-legal.
+12. After pick_other, trust the current `pick_target` in state; classify if color is unknown, or grasp if known and it matches the next mission-inferred fillable slot.
 13. Use `allowed_commands` as the only legality source for what can be done now.
 14. When `holding_object` is true, use `held_cube.color` for place/return decisions; place only on a side whose next required color from `mission_prompt` matches the held cube.
 15. When `holding_object` is false, use `pick_target` for observe/classify/grasp; ignore `held_cube`.
-16. In `phase=grasp`, if `pick_target.is_centered` is true and color is mission-legal, prefer `grasp_cube` over `pick_other`.
-17. If section_status slots show a real color/side/order violation of mission_prompt, choose pick_placed_left or pick_placed_right for that side first before starting a new grasp.
-18. Place actions append to right side of the list, so top or middle or base depending on how many are in the stack: 2, 1 or 0 respectively.
-19. If base/middle order is wrong and correction is allowed, correct first before observe/place for new cubes.
-20. For same-color stack missions, repeated same-color cubes on the correct side are valid up to stack_level 3; do not treat orange-over-orange or blue-over-blue as a mismatch unless mission_prompt says to alternate.
+16. In `phase=grasp`, if `pick_target.is_centered` is true and color matches the next mission-inferred fillable slot, prefer `grasp_cube` over `pick_other`.
+17. If the centered pick_target.color is known but does not match the next mission-inferred fillable slot/side, choose pick_other before grasp_cube.
+18. A color is not legal merely because it appears later in the mission pattern; it must match the next empty slot from stack_level.
+19. If section_status slots show a real color/side/order violation of mission_prompt, choose pick_placed_left or pick_placed_right for that side before starting a new grasp.
+20. pick_placed_left/right removes the exposed cube at the current stack height: stack_level 3 removes the top slot, stack_level 2 removes the middle slot, stack_level 1 removes the base slot.
+21. If a lower slot is wrong, keep correcting that side until the wrong slot is exposed and removed. Then rebuild by placing new cubes.
+22. Place actions append one cube at the next empty height: stack_level 0 -> base, stack_level 1 -> middle, stack_level 2 -> top. Place actions cannot insert under an existing cube or change a covered lower slot.
+23. Example: if mission requires [ORANGE, BLUE, ORANGE] and current stack is [ORANGE, ORANGE, ORANGE], first remove the top orange, then remove the now-exposed middle orange. When only base orange remains, place blue next.
+24. For same-color stack missions, repeated same-color cubes on the correct side are valid up to stack_level 3; do not treat orange-over-orange or blue-over-blue as a mismatch unless mission_prompt says to alternate.
 
 State information you can use:
 - mission_prompt
@@ -38,9 +42,9 @@ State information you can use:
 
 Primary objective:
 1. Follow mission_prompt.
-2. Make safe progress through corrections if needed then place every step.
+2. Make safe progress: complete needed exposed-cube corrections first, then observe/classify/grasp/place.
 3. Mission pattern is defined only by mission_prompt (same-color, alternating, or other).
-4. Use pick_other only when pick_target.color is known and cannot legally be placed on any currently fillable mission stack.
+4. Use pick_other when pick_target.color is known and does not match the next mission-inferred fillable slot.
 
 
 General loop:

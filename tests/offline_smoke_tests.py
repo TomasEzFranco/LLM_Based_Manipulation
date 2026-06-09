@@ -424,11 +424,11 @@ class PlannerContractSnapshotTests(unittest.TestCase):
             last_feedback=None,
         )
         left_expected = {
-            "stack_level": 2,
+            "cube_count": 2,
             "slots": {"base": "orange", "middle": "blue", "top": "empty"},
         }
         right_expected = {
-            "stack_level": 1,
+            "cube_count": 1,
             "slots": {"base": "blue", "middle": "empty", "top": "empty"},
         }
         if bool(getattr(self.core, "PLANNER_INCLUDE_COLOR_SEQUENCE", False)):
@@ -612,7 +612,6 @@ class PlannerContractSnapshotTests(unittest.TestCase):
                 observe_fail_streak=1,
                 observe_fail_stop_after=2,
                 record_policy_step=lambda *args, **kwargs: records.append((args, kwargs)),
-                capture_pick_lock_snapshot_fn=lambda **_kwargs: None,
             )
         finally:
             observe_mod.pick_actions.run_pick_center_cycle = original_run_pick_center_cycle
@@ -623,6 +622,64 @@ class PlannerContractSnapshotTests(unittest.TestCase):
         self.assertEqual(1, int(observe_fail_streak))
         self.assertEqual(0, int(state.no_pick_miss_count))
         self.assertEqual([(("observe_scene", "observe_retry"), {"progress": False})], records)
+
+    def test_observe_clears_pick_other_blocks_before_centering(self):
+        observe_mod = importlib.import_module("runtime_loop_observe")
+        state = self.core.CycleState()
+        state.pick_other_block_track_id = 19
+        state.pick_other_block_xyz = [0.338, -0.160, 0.054]
+        state.pick_other_block_uv = [317, 239]
+        state.pick_other_block_track_ids = [23, 40]
+        state.pick_other_block_xyzs = [[0.346, -0.277, 0.059]]
+        state.pick_other_block_uvs = [[315, 244]]
+        state.pick_other_block_source = "classify"
+        captured: dict = {}
+        original_run_pick_center_cycle = observe_mod.pick_actions.run_pick_center_cycle
+
+        def fake_run_pick_center_cycle(**kwargs):
+            captured["blocked_track_ids"] = set(kwargs.get("blocked_track_ids") or set())
+            captured["blocked_xyzs"] = list(kwargs.get("blocked_xyzs") or [])
+            captured["blocked_uvs"] = list(kwargs.get("blocked_uvs") or [])
+            state.last_center_failure = {
+                "status": "active_detection_timeout",
+                "candidate_count": 3,
+                "filtered_count": 3,
+                "selector_meta": {"eligible_count": 0},
+            }
+            return "retry", None
+
+        observe_mod.pick_actions.run_pick_center_cycle = fake_run_pick_center_cycle
+        try:
+            observe_mod.run_observe_action(
+                command_for_history="observe_scene",
+                clear_first=False,
+                source="policy_observe",
+                state=state,
+                arm=None,
+                per=None,
+                det=None,
+                section_groups=self._empty_section_groups(),
+                cycle_count=1,
+                centered_pos=None,
+                cube_color="unknown",
+                color_conf=0.0,
+                observe_fail_streak=0,
+                observe_fail_stop_after=2,
+                record_policy_step=lambda *_args, **_kwargs: None,
+            )
+        finally:
+            observe_mod.pick_actions.run_pick_center_cycle = original_run_pick_center_cycle
+
+        self.assertEqual(set(), captured.get("blocked_track_ids"))
+        self.assertEqual([], captured.get("blocked_xyzs"))
+        self.assertEqual([], captured.get("blocked_uvs"))
+        self.assertIsNone(state.pick_other_block_track_id)
+        self.assertIsNone(state.pick_other_block_xyz)
+        self.assertIsNone(state.pick_other_block_uv)
+        self.assertEqual([], state.pick_other_block_track_ids)
+        self.assertEqual([], state.pick_other_block_xyzs)
+        self.assertEqual([], state.pick_other_block_uvs)
+        self.assertEqual("none", str(state.pick_other_block_source))
 
     def test_failed_grasp_visible_target_miss_warns_and_retries(self):
         pick_actions = importlib.import_module("pick_actions")
@@ -1110,6 +1167,22 @@ class PureHelperTests(unittest.TestCase):
         self.assertAlmostEqual(0.42, float(anchor_xyz[0]), places=4)
         self.assertAlmostEqual(-0.14, float(anchor_xyz[1]), places=4)
 
+    def test_stack_anchor_x_comp_skips_commanded_base_only(self):
+        place_actions = importlib.import_module("place_actions")
+        self.assertFalse(
+            place_actions._stack_anchor_x_comp_allowed("commanded_place_base_level0")
+        )
+        self.assertTrue(place_actions._stack_anchor_x_comp_allowed("startup_hydrate_top"))
+        self.assertTrue(place_actions._stack_anchor_x_comp_allowed("last_popped_xy"))
+        self.assertTrue(place_actions._stack_anchor_x_comp_allowed(None))
+
+    def test_stack_anchor_x_comp_defaults_keep_top_from_verify_anchor_overpull(self):
+        core = importlib.import_module("runtime_core")
+
+        self.assertTrue(bool(core.STACK_ANCHOR_X_COMP_ENABLED))
+        self.assertAlmostEqual(0.000, float(core.STACK_ANCHOR_X_COMP_LEVEL1_M), places=4)
+        self.assertAlmostEqual(-0.005, float(core.STACK_ANCHOR_X_COMP_M), places=4)
+
     def test_stack_anchor_commanded_level0_ignores_upper_verify_measured(self):
         stack_scene = importlib.import_module("stack_scene")
         core = importlib.import_module("runtime_core")
@@ -1585,11 +1658,12 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         self.assertAlmostEqual(0.225, float(left[1]), places=4)
         self.assertAlmostEqual(0.037, float(left[2]), places=4)
 
-    def test_third_stack_level_release_z_has_extra_clearance(self):
+    def test_third_stack_level_uses_same_dz_step_as_middle(self):
         import place_actions
         import runtime_core as core
 
         base_z = float(core.PLACE_RELEASE_Z_M)
+        self.assertAlmostEqual(0.000, float(core.PLACE_STACK_LEVEL3_EXTRA_Z_M), places=4)
         self.assertAlmostEqual(base_z, place_actions._stack_release_z_for_level(base_z, 0), places=4)
         self.assertAlmostEqual(
             base_z + float(core.PLACE_STACK_LEVEL_DZ_M) + float(core.PLACE_STACK_UPPER_EXTRA_Z_M),
@@ -1599,8 +1673,7 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         self.assertAlmostEqual(
             base_z
             + (2.0 * float(core.PLACE_STACK_LEVEL_DZ_M))
-            + float(core.PLACE_STACK_UPPER_EXTRA_Z_M)
-            + float(core.PLACE_STACK_LEVEL3_EXTRA_Z_M),
+            + float(core.PLACE_STACK_UPPER_EXTRA_Z_M),
             place_actions._stack_release_z_for_level(base_z, 2),
             places=4,
         )
@@ -1656,6 +1729,20 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         self.assertEqual(2, int(target_level))
         self.assertIsNotNone(verify_v2.compute_verify_stack_min_z(0.096, int(target_level)))
         self.assertTrue(bool(core.PLACE_VERIFY_V2_STACK_PREFER_TOP and int(target_level) >= 2))
+
+    def test_place_verify_hard_timeout_covers_recenter_ladder(self):
+        import runtime_core as core
+
+        recenter_windows = (
+            1
+            + max(0, int(core.PLACE_VERIFY_V2_EXPECTED_SLOT_RETRIES))
+            + max(0, int(core.PLACE_VERIFY_V2_TOP_CANDIDATE_CHECKS))
+        )
+        active_budget_s = recenter_windows * float(core.PLACE_VERIFY_V2_ACTIVE_CENTER_TIMEOUT_S)
+
+        self.assertEqual(4, int(recenter_windows))
+        self.assertAlmostEqual(20.0, float(core.PLACE_VERIFY_V2_HARD_TIMEOUT_S), places=4)
+        self.assertGreaterEqual(float(core.PLACE_VERIFY_V2_HARD_TIMEOUT_S), active_budget_s + 1.0)
 
     def test_verify_candidate_filter_ignores_wrong_section_before_tracking(self):
         import runtime_core as core
@@ -1766,17 +1853,38 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         wrong_target["confirmed"] = True
         self.assertTrue(verify_v2._color_geometry_ok_for_commit(wrong_target))
 
-    def test_place_pick_bias_compensate_inverts_grasp_bias(self):
+    def test_place_pick_bias_compensate_disabled_by_default_and_inverts_when_enabled(self):
         import runtime_core as core
 
-        self.assertTrue(bool(core.PLACE_PICK_BIAS_COMPENSATE_ENABLED))
+        self.assertFalse(bool(core.PLACE_PICK_BIAS_COMPENSATE_ENABLED))
         self.assertFalse(bool(core.PLACE_PICK_BIAS_COMPENSATE_STACK_ANCHOR_ENABLED))
         self.assertAlmostEqual(0.037, float(core.PLACE_RELEASE_Z_M), places=4)
         anchor = np.array([0.463, 0.277, 0.165], dtype=float)
         cmd, dx, dy, applied = core.apply_place_pick_bias_compensate(anchor)
+        self.assertFalse(bool(applied))
+        self.assertAlmostEqual(0.0, float(dx), places=4)
+        self.assertAlmostEqual(0.0, float(dy), places=4)
+        self.assertAlmostEqual(float(anchor[0]), float(cmd[0]), places=4)
+        self.assertAlmostEqual(float(anchor[1]), float(cmd[1]), places=4)
+        self.assertAlmostEqual(0.165, float(cmd[2]), places=4)
+
+        old_enabled = core.PLACE_PICK_BIAS_COMPENSATE_ENABLED
+        try:
+            core.PLACE_PICK_BIAS_COMPENSATE_ENABLED = True
+            cmd, dx, dy, applied = core.apply_place_pick_bias_compensate(anchor)
+        finally:
+            core.PLACE_PICK_BIAS_COMPENSATE_ENABLED = old_enabled
         self.assertTrue(bool(applied))
-        self.assertAlmostEqual(-float(core.GRASP_PICK_X_BIAS_M), float(dx), places=4)
-        self.assertAlmostEqual(-float(core.GRASP_PICK_Y_BIAS_M), float(dy), places=4)
+        self.assertAlmostEqual(
+            -float(core.GRASP_PICK_X_BIAS_M) * float(core.PLACE_PICK_BIAS_COMPENSATE_SCALE),
+            float(dx),
+            places=4,
+        )
+        self.assertAlmostEqual(
+            -float(core.GRASP_PICK_Y_BIAS_M) * float(core.PLACE_PICK_BIAS_COMPENSATE_SCALE),
+            float(dy),
+            places=4,
+        )
         self.assertAlmostEqual(float(anchor[0]) + float(dx), float(cmd[0]), places=4)
         self.assertAlmostEqual(float(anchor[1]) + float(dy), float(cmd[1]), places=4)
         self.assertAlmostEqual(0.165, float(cmd[2]), places=4)
@@ -1786,6 +1894,10 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
 
         self.assertFalse(bool(core.STACK_X_LEVEL_OFFSET_ENABLED))
         self.assertTrue(bool(core.STACK_PICK_X_OFFSET_ENABLED))
+        self.assertAlmostEqual(-0.002, float(core.STACK_PICK_X_OFFSET_FAR_M), places=4)
+        self.assertAlmostEqual(-0.005, float(core.STACK_PICK_X_LEVEL2_EXTRA_M), places=4)
+        self.assertAlmostEqual(0.003, float(core.STACK_PICK_X_NEAR_Z_EXTRA_M), places=4)
+        self.assertAlmostEqual(0.002, float(core.STACK_PICK_X_FAR_Z_EXTRA_M), places=4)
 
         near_dx, near_meta = core.compute_stack_pick_x_offset([0.3015, -0.1705, 0.0567])
         self.assertEqual("ok", str(near_meta.get("reason")))
@@ -1810,6 +1922,15 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         self.assertEqual("ok", str(observed_mid_meta.get("reason")))
         self.assertGreater(float(observed_mid_dx), float(core.STACK_PICK_X_OFFSET_NEAR_M))
         self.assertLess(float(observed_mid_dx), float(core.STACK_PICK_X_OFFSET_FAR_M))
+
+        log_pick_dx, log_pick_meta = core.compute_stack_pick_x_offset([0.465, -0.276, 0.065])
+        self.assertEqual("ok", str(log_pick_meta.get("reason")))
+        self.assertAlmostEqual(0.474, 0.480 + float(log_pick_dx), places=3)
+        self.assertAlmostEqual(
+            0.469,
+            0.480 + float(log_pick_dx) + float(core.STACK_PICK_X_LEVEL2_EXTRA_M),
+            places=3,
+        )
 
     def test_stack_pick_x_offset_reports_missing_pick_xyz(self):
         import runtime_core as core
@@ -1926,6 +2047,430 @@ class TestPlaceMeasurementPolicy(unittest.TestCase):
         )
         self.assertFalse(bool(evaluation.get("accepted")))
         self.assertEqual("color_mismatch", str(evaluation.get("reason")))
+
+    def test_higher_layer_classifier_detects_same_xy_high_z_unconfirmed_stack(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+
+        place_verify = {
+            "status": "placed_mismatch_out_of_margin",
+            "confirmed": False,
+            "expected_xyz_eval": [0.480, 0.225, 0.068],
+            "measured_xyz": [0.486, 0.224, 0.128],
+        }
+
+        result = place_handler._classify_place_verify_higher_layer_scan(
+            place_verify=place_verify,
+            section=core.SECTION_LEFT_NAME,
+            pending_stack_level=1,
+        )
+
+        self.assertTrue(bool(result.get("detected")))
+        self.assertEqual("expected_layer_scanned_higher_than_expected", str(result.get("reason")))
+        self.assertAlmostEqual(0.060, float(result.get("z_delta_m")), places=4)
+
+    def test_higher_layer_classifier_rejects_missing_wrong_xy_confirmed_and_absurd_z(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+
+        base = {
+            "status": "placed_mismatch_out_of_margin",
+            "confirmed": False,
+            "expected_xyz_eval": [0.480, 0.225, 0.068],
+            "measured_xyz": [0.486, 0.224, 0.128],
+        }
+        cases = [
+            ("missing_measured_xyz", {**base, "measured_xyz": None}, core.SECTION_LEFT_NAME, 1),
+            ("xy_out_of_gate", {**base, "measured_xyz": [0.550, 0.225, 0.128]}, core.SECTION_LEFT_NAME, 1),
+            ("already_confirmed", {**base, "confirmed": True}, core.SECTION_LEFT_NAME, 1),
+            ("invalid_section", base, "center", 1),
+            ("z_delta_too_large", {**base, "measured_xyz": [0.486, 0.224, 0.250]}, core.SECTION_LEFT_NAME, 1),
+        ]
+        for reason, verify_row, section, pending in cases:
+            with self.subTest(reason=reason):
+                result = place_handler._classify_place_verify_higher_layer_scan(
+                    place_verify=verify_row,
+                    section=section,
+                    pending_stack_level=pending,
+                )
+                self.assertFalse(bool(result.get("detected")))
+                self.assertEqual(reason, str(result.get("reason")))
+
+    def test_higher_layer_classifier_uses_verify_reject_even_after_middle_confirm(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+
+        place_verify = {
+            "status": "placed_confirmed_geometry",
+            "confirmed": True,
+            "expected_xyz_eval": [0.480, 0.100, 0.132],
+            "measured_xyz": [0.451, 0.090, 0.135],
+            "verify_higher_layer_reject_seen": True,
+            "verify_higher_layer_rejects": [
+                {
+                    "track_id": 40,
+                    "selected_xyz": [0.471, 0.107, 0.179],
+                    "expected_xyz_eval": [0.480, 0.100, 0.132],
+                    "xy_error_m": 0.011,
+                    "z_delta_m": 0.047,
+                    "xy_gate_m": 0.030,
+                    "min_dz_m": 0.030,
+                    "max_dz_m": 0.140,
+                    "status": "placed_mismatch_out_of_margin",
+                }
+            ],
+        }
+
+        result = place_handler._classify_place_verify_higher_layer_scan(
+            place_verify=place_verify,
+            section=core.SECTION_RIGHT_NAME,
+            pending_stack_level=2,
+        )
+
+        self.assertTrue(bool(result.get("detected")))
+        self.assertEqual("verify_higher_layer_reject", str(result.get("source")))
+        self.assertTrue(bool(result.get("original_confirmed")))
+        self.assertEqual(40, int(result.get("track_id")))
+
+    def test_higher_layer_hydrate_accepts_pending_layer_and_reports_extra_layers(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+
+        startup_row = {
+            "hydration_status": "ok",
+            "hydration_unresolved_visible_track_ids": [99],
+            "hydrated_stacks": {
+                "sections": {
+                    core.SECTION_LEFT_NAME: {
+                        "stack_level": 2,
+                        "top_color": "orange",
+                        "color_sequence_bottom_to_top": ["blue", "orange"],
+                        "tracks_bottom_to_top": [31, 32],
+                        "entries": [
+                            {"track_id": 31, "xyz": [0.481, 0.224, 0.067], "color": "blue"},
+                            {"track_id": 32, "xyz": [0.482, 0.224, 0.128], "color": "orange"},
+                        ],
+                    }
+                }
+            },
+        }
+
+        evaluation = place_handler._evaluate_place_verify_higher_layer_hydrate(
+            startup_boot_row=startup_row,
+            section=core.SECTION_LEFT_NAME,
+            pending_stack_level=1,
+            expected_color="blue",
+            place_verify={
+                "expected_xyz_eval": [0.480, 0.225, 0.068],
+                "effective_z_margin_m": 0.023,
+            },
+        )
+
+        self.assertTrue(bool(evaluation.get("accepted")))
+        self.assertEqual(2, int(evaluation.get("hydrated_level")))
+        self.assertEqual(1, int(evaluation.get("observed_extra_layers")))
+        self.assertEqual("blue", str(evaluation.get("measured_color")))
+        self.assertAlmostEqual(0.001, float(evaluation.get("z_error_m")), places=4)
+        self.assertEqual([99], list(evaluation.get("unresolved_visible_track_ids", [])))
+        self.assertTrue(bool(evaluation.get("unresolved_visible_tracks_ignored_for_scoped_apply")))
+
+    def test_higher_layer_complete_hydrate_accepts_hidden_pending_layer_xy_mismatch(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+        import stack_scene
+
+        startup_row = {
+            "hydration_status": "ok",
+            "hydration_missing_sides": [],
+            "hydration_expected_shortfall_sides": [],
+            "hydration_unresolved_visible_track_ids": [],
+            "hydrated_stacks": {
+                "observed_stack_levels": {
+                    core.SECTION_LEFT_NAME: 3,
+                    core.SECTION_RIGHT_NAME: 3,
+                },
+                "expected_stack_levels": {
+                    core.SECTION_LEFT_NAME: 3,
+                    core.SECTION_RIGHT_NAME: 3,
+                },
+                "sections": {
+                    core.SECTION_LEFT_NAME: {
+                        "stack_level": 3,
+                        "top_color": "blue",
+                        "color_sequence_bottom_to_top": ["blue", "orange", "blue"],
+                        "tracks_bottom_to_top": [75, 77, 76],
+                        "entries": [
+                            {"track_id": 75, "xyz": [0.433, 0.226, 0.092], "color": "blue"},
+                            {"track_id": 77, "xyz": [0.428, 0.232, 0.135], "color": "orange"},
+                            {"track_id": 76, "xyz": [0.453, 0.245, 0.180], "color": "blue"},
+                        ],
+                    },
+                    core.SECTION_RIGHT_NAME: {
+                        "stack_level": 3,
+                        "top_color": "orange",
+                        "color_sequence_bottom_to_top": ["orange", "blue", "orange"],
+                        "tracks_bottom_to_top": [108, 79, 74],
+                        "entries": [
+                            {"track_id": 108, "xyz": [0.434, 0.091, 0.087], "color": "orange"},
+                            {"track_id": 79, "xyz": [0.433, 0.092, 0.122], "color": "blue"},
+                            {"track_id": 74, "xyz": [0.458, 0.096, 0.176], "color": "orange"},
+                        ],
+                    },
+                },
+            },
+        }
+
+        evaluation = place_handler._evaluate_place_verify_higher_layer_hydrate(
+            startup_boot_row=startup_row,
+            section=core.SECTION_RIGHT_NAME,
+            pending_stack_level=2,
+            expected_color="blue",
+            place_verify={
+                "expected_xyz_eval": [0.480, 0.100, 0.132],
+                "effective_z_margin_m": 0.023,
+            },
+        )
+
+        self.assertTrue(bool(evaluation.get("accepted")))
+        self.assertEqual(
+            "complete_hydrate_authoritative_after_higher_layer",
+            str(evaluation.get("reason")),
+        )
+        self.assertTrue(bool(evaluation.get("geometry_gate_skipped")))
+        self.assertGreater(float(evaluation.get("xy_error_m")), float(evaluation.get("xy_margin_m")))
+
+        state = core.CycleState()
+        state.startup_hydrated_sections = {
+            core.SECTION_LEFT_NAME: {
+                "stack_level": 1,
+                "top_color": "blue",
+                "color_sequence_bottom_to_top": ["blue"],
+                "tracks_bottom_to_top": [10],
+                "entries": [{"track_id": 10, "xyz": [0.480, 0.225, 0.067], "color": "blue"}],
+            },
+            core.SECTION_RIGHT_NAME: {
+                "stack_level": 1,
+                "top_color": "orange",
+                "color_sequence_bottom_to_top": ["orange"],
+                "tracks_bottom_to_top": [20],
+                "entries": [{"track_id": 20, "xyz": [0.480, 0.100, 0.067], "color": "orange"}],
+            },
+        }
+        apply_result = stack_scene.apply_startup_stack_hydration_for_section(
+            state,
+            startup_row,
+            core.SECTION_RIGHT_NAME,
+        )
+        left_row = stack_scene.get_startup_hydrated_section_row(state, core.SECTION_LEFT_NAME)
+        right_row = stack_scene.get_startup_hydrated_section_row(state, core.SECTION_RIGHT_NAME)
+
+        self.assertTrue(bool(apply_result.get("changed")))
+        self.assertEqual(1, int(left_row.get("stack_level")))
+        self.assertEqual(3, int(right_row.get("stack_level")))
+        self.assertEqual(["orange", "blue", "orange"], list(right_row.get("color_sequence_bottom_to_top", [])))
+
+    def test_higher_layer_hydrate_rejects_unresolved_shortfall_color_missing_xy_and_z(self):
+        import runtime_core as core
+        import runtime_loop_actions_place as place_handler
+
+        base_row = {
+            "hydration_status": "ok",
+            "hydration_unresolved_visible_track_ids": [],
+            "hydrated_stacks": {
+                "sections": {
+                    core.SECTION_LEFT_NAME: {
+                        "stack_level": 1,
+                        "top_color": "blue",
+                        "color_sequence_bottom_to_top": ["blue"],
+                        "tracks_bottom_to_top": [31],
+                        "entries": [
+                            {"track_id": 31, "xyz": [0.481, 0.224, 0.067], "color": "blue"},
+                        ],
+                    }
+                }
+            },
+        }
+        verify_row = {
+            "expected_xyz_eval": [0.480, 0.225, 0.068],
+            "effective_z_margin_m": 0.023,
+        }
+        cases = [
+            ("level_below_pending", base_row, 2, "blue"),
+            ("color_mismatch", base_row, 1, "orange"),
+            (
+                "missing_layer_xyz",
+                {
+                    **base_row,
+                    "hydrated_stacks": {
+                        "sections": {
+                            core.SECTION_LEFT_NAME: {
+                                "stack_level": 1,
+                                "color_sequence_bottom_to_top": ["blue"],
+                                "entries": [{"track_id": 31, "color": "blue"}],
+                            }
+                        }
+                    },
+                },
+                1,
+                "blue",
+            ),
+            (
+                "xy_out_of_margin",
+                {
+                    **base_row,
+                    "hydrated_stacks": {
+                        "sections": {
+                            core.SECTION_LEFT_NAME: {
+                                "stack_level": 1,
+                                "color_sequence_bottom_to_top": ["blue"],
+                                "entries": [{"track_id": 31, "xyz": [0.540, 0.225, 0.067], "color": "blue"}],
+                            }
+                        }
+                    },
+                },
+                1,
+                "blue",
+            ),
+            (
+                "z_out_of_margin",
+                {
+                    **base_row,
+                    "hydrated_stacks": {
+                        "sections": {
+                            core.SECTION_LEFT_NAME: {
+                                "stack_level": 1,
+                                "color_sequence_bottom_to_top": ["blue"],
+                                "entries": [{"track_id": 31, "xyz": [0.481, 0.224, 0.120], "color": "blue"}],
+                            }
+                        }
+                    },
+                },
+                1,
+                "blue",
+            ),
+        ]
+        for reason, startup_row, pending, expected_color in cases:
+            with self.subTest(reason=reason):
+                evaluation = place_handler._evaluate_place_verify_higher_layer_hydrate(
+                    startup_boot_row=startup_row,
+                    section=core.SECTION_LEFT_NAME,
+                    pending_stack_level=pending,
+                    expected_color=expected_color,
+                    place_verify=verify_row,
+                )
+                self.assertFalse(bool(evaluation.get("accepted")))
+                self.assertEqual(reason, str(evaluation.get("reason")))
+
+    def test_side_only_hydration_applies_one_section_and_preserves_other_side(self):
+        import runtime_core as core
+        import stack_scene
+
+        state = core.CycleState()
+        state.startup_hydrated_sections = {
+            core.SECTION_LEFT_NAME: {
+                "stack_level": 1,
+                "top_color": "blue",
+                "color_sequence_bottom_to_top": ["blue"],
+                "tracks_bottom_to_top": [10],
+                "entries": [{"track_id": 10, "xyz": [0.480, 0.225, 0.067], "color": "blue"}],
+            },
+            core.SECTION_RIGHT_NAME: {
+                "stack_level": 1,
+                "top_color": "orange",
+                "color_sequence_bottom_to_top": ["orange"],
+                "tracks_bottom_to_top": [20],
+                "entries": [{"track_id": 20, "xyz": [0.480, 0.100, 0.067], "color": "orange"}],
+            },
+        }
+        startup_row = {
+            "hydrated_stacks": {
+                "sections": {
+                    core.SECTION_LEFT_NAME: {
+                        "stack_level": 2,
+                        "top_color": "orange",
+                        "color_sequence_bottom_to_top": ["blue", "orange"],
+                        "tracks_bottom_to_top": [10, 11],
+                        "entries": [
+                            {"track_id": 10, "xyz": [0.480, 0.225, 0.067], "color": "blue"},
+                            {"track_id": 11, "xyz": [0.481, 0.226, 0.128], "color": "orange"},
+                        ],
+                    },
+                    core.SECTION_RIGHT_NAME: {
+                        "stack_level": 2,
+                        "top_color": "blue",
+                        "color_sequence_bottom_to_top": ["orange", "blue"],
+                        "tracks_bottom_to_top": [20, 21],
+                        "entries": [
+                            {"track_id": 20, "xyz": [0.480, 0.100, 0.067], "color": "orange"},
+                            {"track_id": 21, "xyz": [0.480, 0.100, 0.128], "color": "blue"},
+                        ],
+                    },
+                }
+            }
+        }
+
+        result = stack_scene.apply_startup_stack_hydration_for_section(
+            state,
+            startup_row,
+            core.SECTION_LEFT_NAME,
+        )
+
+        self.assertTrue(bool(result.get("changed")))
+        left_row = stack_scene.get_startup_hydrated_section_row(state, core.SECTION_LEFT_NAME)
+        right_row = stack_scene.get_startup_hydrated_section_row(state, core.SECTION_RIGHT_NAME)
+        self.assertEqual(2, int(left_row.get("stack_level")))
+        self.assertEqual(["blue", "orange"], list(left_row.get("color_sequence_bottom_to_top", [])))
+        self.assertEqual(1, int(right_row.get("stack_level")))
+        self.assertEqual(["orange"], list(right_row.get("color_sequence_bottom_to_top", [])))
+        anchor_xyz, anchor_source = stack_scene.get_latest_side_stack_anchor_xyz(
+            state,
+            core.SECTION_LEFT_NAME,
+        )
+        self.assertEqual("startup_hydrate_top", str(anchor_source))
+        self.assertAlmostEqual(0.128, float(anchor_xyz[2]), places=4)
+
+    def test_higher_layer_authoritative_marker_skips_append(self):
+        import runtime_loop_actions_place as place_handler
+
+        self.assertTrue(
+            bool(
+                place_handler._place_verify_authoritative_state_already_applied(
+                    {"authoritative_state_source": "higher_layer_scoped_hydrate"}
+                )
+            )
+        )
+        self.assertFalse(bool(place_handler._place_verify_authoritative_state_already_applied({})))
+
+    def test_higher_layer_unresolved_hydrate_reject_skips_remeasure(self):
+        import runtime_loop_actions_place as place_handler
+
+        self.assertTrue(
+            bool(
+                place_handler._should_skip_remeasure_after_higher_layer_hydrate_reject(
+                    {
+                        "status": "expected_layer_scanned_higher_than_expected",
+                        "higher_layer_hydrate": {"reason": "unresolved_visible_tracks"},
+                    }
+                )
+            )
+        )
+        self.assertFalse(
+            bool(
+                place_handler._should_skip_remeasure_after_higher_layer_hydrate_reject(
+                    {
+                        "status": "expected_layer_scanned_higher_than_expected",
+                        "higher_layer_hydrate": {"reason": "level_below_pending"},
+                    }
+                )
+            )
+        )
+        self.assertFalse(
+            bool(
+                place_handler._should_skip_remeasure_after_higher_layer_hydrate_reject(
+                    {"status": "placed_mismatch_out_of_margin"}
+                )
+            )
+        )
 
     def test_place_verify_hold_diag_includes_expected_measured_and_remeasure(self):
         import runtime_loop_actions_place as place_handler

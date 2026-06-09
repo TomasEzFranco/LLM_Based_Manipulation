@@ -6,7 +6,7 @@
       "id": "prompt_1_color_split",
       "steps_required_default": 6,
       "initial_condition": "L=;R=;P=B3O3",
-      "text": "1. Stack Blue cubes left.\n2. Stack Orange cubes right.\n3. Use pick_placed_left/right to make corrections."
+      "text": "1. Stack Blue cubes left.\n2. Stack Orange cubes right.\n3. Use pick_placed_left/right to make corrections.\n4. Use stop_run only when left has 3 blue cubes and right has 3 orange cubes."
     },
     {
       "id": "prompt_2_orange_right",
@@ -18,7 +18,16 @@
       "id": "prompt_3_alternating_two_stacks",
       "steps_required_default": 8,
       "initial_condition": "L=BBO;R=BBO;P=",
-      "text": "1. Build TWO stacks, each exactly 3 cubes high.\n2. Fill LEFT stack first, then RIGHT stack.\n3. Required pattern for each stack (bottom to top): BLUE, ORANGE, BLUE.\n4. If centered cube color is not legal for the current target stack level, use pick_other before grasp.\n5. Use pick_placed_left/right only to correct a placed stack that violates the required pattern.\n6. Use stop_run only when LEFT and RIGHT are both [BLUE, ORANGE, BLUE]."
+      "text": "1. Build TWO stacks, each exactly 3 cubes high.\n2. Fill LEFT stack first, then RIGHT stack.\n3. Required pattern for each stack (bottom to top): BLUE, ORANGE, BLUE; stack_level 0 needs BLUE, stack_level 1 needs ORANGE, stack_level 2 needs BLUE.\n4. If centered cube color is not legal for the current LEFT-first target stack level, use pick_other before grasp_cube.\n5. Use pick_placed_left/right only to correct a placed stack that violates the required pattern.\n6. Use stop_run only when LEFT and RIGHT are both [BLUE, ORANGE, BLUE]."
+    },
+    {
+      "id": "prompt_4_alternating_correction",
+      "steps_required_default": 6,
+      "completion_scoring": "final_stack",
+      "target_left_stack": "BOB",
+      "target_right_stack": "OBO",
+      "initial_condition": "L=BOB;R=B;P=2O",
+      "text": "1. Stack blue orange blue left.\n2. Stack orange blue orange right.\n3. Use pick_misplaced only to correct a placed stack that violates the required pattern.\n4. If centered cube color is not legal for the current target stack level, use pick_other before grasp_cube.\n5. Use stop_run when left is blue orange blue and right is orange blue orange."
     }
   ]
 }

@@ -87,6 +87,27 @@ def clear_pick_lock_snapshot(*, state, source: str) -> None:
     print(f"[PickLock] cleared source={source}")
 
 
+def clear_pick_other_block_context(*, state, source: str) -> None:
+    had_context = bool(
+        getattr(state, "pick_other_block_track_id", None) is not None
+        or getattr(state, "pick_other_block_xyz", None) is not None
+        or getattr(state, "pick_other_block_uv", None) is not None
+        or list(getattr(state, "pick_other_block_track_ids", []) or [])
+        or list(getattr(state, "pick_other_block_xyzs", []) or [])
+        or list(getattr(state, "pick_other_block_uvs", []) or [])
+        or str(getattr(state, "pick_other_block_source", "none")).strip().lower() != "none"
+    )
+    state.pick_other_block_track_id = None
+    state.pick_other_block_xyz = None
+    state.pick_other_block_uv = None
+    state.pick_other_block_track_ids = []
+    state.pick_other_block_xyzs = []
+    state.pick_other_block_uvs = []
+    state.pick_other_block_source = "none"
+    if bool(had_context):
+        print(f"[PickOtherBlock] cleared source={source}")
+
+
 def _normalize_pick_other_block_context(state) -> tuple[set[int], list[list[float]], list[list[int]]]:
     max_items = max(1, int(getattr(core, "PICK_OTHER_PERSIST_BLOCK_MAX", 8)))
     blocked_track_ids: set[int] = set()
@@ -185,28 +206,19 @@ def run_observe_action(
     observe_fail_streak: int,
     observe_fail_stop_after: int,
     record_policy_step,
-    capture_pick_lock_snapshot_fn,
 ) -> tuple[tuple[int, int] | None, str, float, int]:
     if source == "policy_reobserve":
         state.reobserve_requests += 1
     elif source == "auto_recovery":
         state.auto_recovery_observes += 1
     clear_pick_lock_snapshot(state=state, source=f"{source}_begin")
+    clear_pick_other_block_context(state=state, source=f"{source}_begin")
     if clear_first:
         centered_pos = None
         cube_color = "unknown"
         color_conf = 0.0
         print("[Policy] reobserve requested; running active rescan.")
-    block_source = str(getattr(state, "pick_other_block_source", "none")).strip().lower()
-    if block_source in {"classify", "return"}:
-        blocked_track_ids, blocked_xyzs, blocked_uvs = _normalize_pick_other_block_context(state)
-    else:
-        blocked_track_ids, blocked_xyzs, blocked_uvs = set(), [], []
-    if blocked_track_ids or blocked_xyzs or blocked_uvs:
-        print(
-            f"[PickOtherBlock] applying_to_observe source={block_source} "
-            f"tracks={sorted(blocked_track_ids)} xyzs={len(blocked_xyzs)} uvs={len(blocked_uvs)}"
-        )
+    blocked_track_ids, blocked_xyzs, blocked_uvs = set(), [], []
     pick_status, centered_pos = pick_actions.run_pick_center_cycle(
         state=state,
         arm=arm,
@@ -297,7 +309,6 @@ def run_pick_other_action(
     place_verify_v2_min_hits: int,
     pick_other_validate_samples: int,
     record_policy_step,
-    capture_pick_lock_snapshot_fn,
 ) -> tuple[tuple[int, int] | None, str, float]:
     state.reobserve_requests += 1
     source = str(getattr(state, "pick_other_block_source", "none")).strip().lower()
@@ -376,13 +387,7 @@ def run_pick_other_action(
     if str(cube_color).strip().lower() in {"orange", "blue"}:
         print(f"[Color] pick_other_locked classified as {cube_color} (conf={float(color_conf):.3f})")
     # One-shot use: once alternate target is locked, clear seed context.
-    state.pick_other_block_track_id = None
-    state.pick_other_block_xyz = None
-    state.pick_other_block_uv = None
-    state.pick_other_block_track_ids = []
-    state.pick_other_block_xyzs = []
-    state.pick_other_block_uvs = []
-    state.pick_other_block_source = "none"
+    clear_pick_other_block_context(state=state, source="pick_other_lock")
     capture_pick_lock_snapshot(
         state=state,
         centered_pos=centered_pos,

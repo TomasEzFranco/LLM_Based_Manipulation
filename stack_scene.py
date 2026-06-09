@@ -28,6 +28,7 @@ def _bind_core_globals() -> None:
         '_startup_side_full_rescan_top_to_bottom', '_startup_vote_hits_for_layer_slot',
         '_normalize_hydrated_section_row', '_merge_hydrated_section_row_keep_known',
         'run_startup_stack_identity_pass', 'apply_startup_stack_hydration',
+        'apply_startup_stack_hydration_for_section',
         'get_startup_hydrated_section_row', '_sync_last_begin_hydrated_stacks',
         '_set_authoritative_section_sequence', 'get_authoritative_stack_levels',
         'append_authoritative_stack_cube', 'pop_authoritative_stack_top',
@@ -1445,6 +1446,47 @@ def run_startup_stack_identity_pass(
         )
         rep_rows = rep_rows[:max_cubes_total]
         rep_rows_count = int(len(rep_rows))
+        discovery_expected_levels: dict[str, int] = {
+            SECTION_LEFT_NAME: 0,
+            SECTION_RIGHT_NAME: 0,
+        }
+        for rep_row in list(rep_rows):
+            xyz_rep = _finite_xyz_or_none(rep_row.get("xyz", None))
+            if xyz_rep is None:
+                continue
+            section_hint, assign_info = _infer_section_for_place_xy(
+                float(xyz_rep[0]),
+                float(xyz_rep[1]),
+                section_centers_xy,
+                band_min=None,
+                band_max=None,
+                max_center_dist_m=float(STARTUP_STACK_LOCK_ASSIGN_XY_MARGIN_M),
+            )
+            section_hint_norm = (
+                "" if section_hint is None else str(section_hint).strip().lower()
+            )
+            if section_hint_norm not in {SECTION_LEFT_NAME, SECTION_RIGHT_NAME}:
+                if bool(STARTUP_STACK_ASSIGN_DEBUG):
+                    assign_reason = (
+                        str(assign_info.get("reason", "unknown"))
+                        if isinstance(assign_info, dict)
+                        else "unknown"
+                    )
+                    print(
+                        f"[StartupHydrateDiscoveryExpected] skipped "
+                        f"xyz={_format_xyz_log_3(xyz_rep)} reason={assign_reason}"
+                    )
+                continue
+            rep_row["section_hint"] = str(section_hint_norm)
+            discovery_expected_levels[str(section_hint_norm)] = min(
+                int(STARTUP_STACK_MAX_CUBES_PER_SIDE),
+                int(discovery_expected_levels.get(str(section_hint_norm), 0)) + 1,
+            )
+        if any(int(v) > 0 for v in discovery_expected_levels.values()):
+            print(
+                f"[StartupHydrateDiscoveryExpected] levels="
+                f"{dict(discovery_expected_levels)} rows={int(rep_rows_count)}"
+            )
         lock_failed_rows = 0
         processed_track_ids: set[int] = set()
         accepted_xyzs: list[np.ndarray] = []
@@ -1504,37 +1546,45 @@ def run_startup_stack_identity_pass(
             )
             return rows, (int(cx_now), int(cy_now))
 
+        def _append_startup_checklist_target(row: dict, source: str) -> bool:
+            if int(len(checklist_rows)) >= int(max_cubes_total):
+                return False
+            try:
+                tid_i = int(row.get("track_id"))
+            except Exception:
+                return False
+            if int(tid_i) in checklist_tid_set:
+                return False
+            checklist_tid_set.add(int(tid_i))
+            row_i = int(len(checklist_rows))
+            checklist_rows.append(
+                {
+                    "key": f"track:{tid_i}",
+                    "track_id": int(tid_i),
+                    "expected_track_id_initial": int(tid_i),
+                    "final_track_id": None,
+                    "rebound": False,
+                    "rebind_reason": "",
+                    "row_index": int(row_i),
+                    "row": dict(row),
+                    "seed_source": str(source),
+                    "status": "pending",
+                    "attempts": 0,
+                    "last_seen_ts": None,
+                    "last_lock_reason": "pending",
+                    "exit_reason": "",
+                }
+            )
+            return True
+
         def _append_visible_targets_from_observation(obs_row: SceneObservation | None) -> int:
             if _startup_hydrate_should_exit_when_sides_full(entries_by_section):
                 return 0
             rows, _ = _collect_visible_targets(obs_row)
             added = 0
             for row in rows:
-                if int(len(checklist_rows)) >= int(max_cubes_total):
-                    break
-                tid_i = int(row.get("track_id"))
-                if int(tid_i) in checklist_tid_set:
-                    continue
-                checklist_tid_set.add(int(tid_i))
-                row_i = int(len(checklist_rows))
-                checklist_rows.append(
-                    {
-                        "key": f"track:{tid_i}",
-                        "track_id": int(tid_i),
-                        "expected_track_id_initial": int(tid_i),
-                        "final_track_id": None,
-                        "rebound": False,
-                        "rebind_reason": "",
-                        "row_index": int(row_i),
-                        "row": dict(row),
-                        "status": "pending",
-                        "attempts": 0,
-                        "last_seen_ts": None,
-                        "last_lock_reason": "pending",
-                        "exit_reason": "",
-                    }
-                )
-                added += 1
+                if bool(_append_startup_checklist_target(row, "visible")):
+                    added += 1
             return int(added)
 
         obs_lock_seed = observe_scene_frame(
@@ -1547,6 +1597,15 @@ def run_startup_stack_identity_pass(
             update_tracks=True,
         )
         _append_visible_targets_from_observation(obs_lock_seed)
+        discovery_seeded = 0
+        for row in list(rep_rows):
+            if bool(_append_startup_checklist_target(row, "discovery")):
+                discovery_seeded += 1
+        if int(discovery_seeded) > 0:
+            print(
+                f"[StartupHydrateDiscoverySeed] added={int(discovery_seeded)} "
+                f"checklist_total={int(len(checklist_rows))}"
+            )
 
         checklist_committed = 0
         checklist_failed = 0
@@ -2321,7 +2380,11 @@ def run_startup_stack_identity_pass(
                     continue
                 slot_base_z = _startup_section_stack_base_z(str(section_name))
                 dz_step = max(1e-6, float(STACK_LEVEL_DZ_M))
-                expected_layers = int(round((float(top_xyz[2]) - float(slot_base_z)) / dz_step)) + 1
+                top_z_m = float(top_xyz[2])
+                if top_z_m < float(STARTUP_STACK_EXPECTED_LAYER_MIN_TOP_Z_M):
+                    expected_layers = 1
+                else:
+                    expected_layers = int(round((top_z_m - float(slot_base_z)) / dz_step)) + 1
                 expected_layers = max(1, min(int(max_layers_side), int(expected_layers)))
                 z_predict_stats[str(section_name)]["expected"] = int(expected_layers)
                 if int(expected_layers) <= int(committed_before):
@@ -2624,7 +2687,14 @@ def run_startup_stack_identity_pass(
         for section_name in [SECTION_LEFT_NAME, SECTION_RIGHT_NAME]:
             z_stats = z_predict_stats.get(str(section_name), {})
             observed_level = int(observed_lock_stack_levels.get(str(section_name), 0) or 0)
-            expected_level = max(observed_level, int(z_stats.get("expected", 0) or 0))
+            discovery_expected_level = int(
+                discovery_expected_levels.get(str(section_name), 0) or 0
+            )
+            expected_level = max(
+                observed_level,
+                int(z_stats.get("expected", 0) or 0),
+                int(discovery_expected_level),
+            )
             expected_stack_levels[str(section_name)] = int(expected_level)
             if int(expected_level) > int(observed_level):
                 expected_shortfall_sides.append(str(section_name))
@@ -2671,6 +2741,7 @@ def run_startup_stack_identity_pass(
                     f"seq={list(seq_expected)}"
                 )
         summary["expected_stack_levels"] = dict(expected_stack_levels)
+        summary["discovery_expected_stack_levels"] = dict(discovery_expected_levels)
         summary["expected_level_shortfall_sides"] = list(expected_shortfall_sides)
         summary["observed_lock_stack_levels"] = dict(observed_lock_stack_levels)
         if bool(expected_shortfall_sides):
@@ -2876,6 +2947,89 @@ def apply_startup_stack_hydration(state: CycleState, startup_row: dict | None) -
         f"{SECTION_RIGHT_NAME}={right_seq_dbg}"
     )
     return levels
+
+
+def _update_stack_anchor_from_hydrated_section_row(
+    state: CycleState,
+    section_name: str,
+    section_row: dict,
+) -> None:
+    _bind_core_globals()
+    section_norm = str(section_name).strip().lower()
+    try:
+        section_level = int(section_row.get("stack_level", 0) or 0)
+    except Exception:
+        section_level = 0
+    if section_level <= 0:
+        _clear_locked_stack_anchor_xyz(state, section_norm)
+        _clear_last_popped_xy(state, section_norm)
+        return
+    top_xyz: list[float] | None = None
+    top_z = float("-inf")
+    for entry in list(section_row.get("entries", [])):
+        if not isinstance(entry, dict):
+            continue
+        xyz = _finite_xyz_or_none(entry.get("xyz", None))
+        if xyz is None:
+            continue
+        try:
+            z_val = float(xyz[2])
+        except Exception:
+            continue
+        if (not np.isfinite(z_val)) or (z_val <= top_z):
+            continue
+        top_z = float(z_val)
+        top_xyz = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+    if top_xyz is not None:
+        _set_locked_stack_anchor_xyz(state, section_norm, top_xyz, "startup_hydrate_top")
+    else:
+        _clear_locked_stack_anchor_xyz(state, section_norm)
+
+
+def apply_startup_stack_hydration_for_section(
+    state: CycleState,
+    startup_row: dict | None,
+    section_name: str,
+) -> dict:
+    _bind_core_globals()
+    section_norm = str(section_name).strip().lower()
+    if section_norm not in {SECTION_LEFT_NAME, SECTION_RIGHT_NAME}:
+        return {"changed": False, "reason": "invalid_section", "section": section_norm}
+    row = startup_row if isinstance(startup_row, dict) else {}
+    hydrated_src = row.get("hydrated_stacks", None)
+    if not isinstance(hydrated_src, dict):
+        return {"changed": False, "reason": "missing_hydrated_stacks", "section": section_norm}
+    sections_src = hydrated_src.get("sections", None)
+    if not isinstance(sections_src, dict) or section_norm not in sections_src:
+        return {"changed": False, "reason": "missing_section_row", "section": section_norm}
+    section_row = _normalize_hydrated_section_row(sections_src.get(section_norm, {}))
+    section_level = int(section_row.get("stack_level", 0) or 0)
+    if int(section_level) <= 0:
+        return {"changed": False, "reason": "empty_section_row", "section": section_norm}
+
+    left_prev = get_startup_hydrated_section_row(state, SECTION_LEFT_NAME)
+    right_prev = get_startup_hydrated_section_row(state, SECTION_RIGHT_NAME)
+    out_sections = {
+        SECTION_LEFT_NAME: dict(left_prev),
+        SECTION_RIGHT_NAME: dict(right_prev),
+    }
+    out_sections[section_norm] = dict(section_row)
+    state.startup_hydrated_sections = dict(out_sections)
+    _update_stack_anchor_from_hydrated_section_row(state, section_norm, section_row)
+    _sync_last_begin_hydrated_stacks(state)
+    levels = get_authoritative_stack_levels(state)
+    print(
+        f"[StartupHydrateSection] section={section_norm} level={int(section_level)} "
+        f"preserved_other={SECTION_RIGHT_NAME if section_norm == SECTION_LEFT_NAME else SECTION_LEFT_NAME}"
+    )
+    return {
+        "changed": True,
+        "reason": "ok",
+        "section": section_norm,
+        "stack_level": int(section_level),
+        "sequence": list(section_row.get("color_sequence_bottom_to_top", [])),
+        "levels": dict(levels),
+    }
 
 
 def get_startup_hydrated_section_row(state: CycleState, section_name: str) -> dict:

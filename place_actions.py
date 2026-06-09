@@ -45,9 +45,13 @@ def _apply_place_pick_bias_compensate_with_log(
             f"xy_delta=({float(dx):+.3f},{float(dy):+.3f}) "
             f"anchor=({anchor_x:.3f},{anchor_y:.3f}) "
             f"cmd=({float(compensated[0]):.3f},{float(compensated[1]):.3f}) "
-            f"scale={float(PLACE_PICK_BIAS_COMPENSATE_SCALE):.2f}"
+        f"scale={float(PLACE_PICK_BIAS_COMPENSATE_SCALE):.2f}"
         )
     return compensated, float(dx), float(dy), bool(applied)
+
+
+def _stack_anchor_x_comp_allowed(stack_anchor_source: str | None) -> bool:
+    return str(stack_anchor_source) != "commanded_place_base_level0"
 
 
 def slot_target_xyz(slot_index: int) -> np.ndarray:
@@ -677,18 +681,48 @@ def execute_prompted_place_action(
     command_target_xyz = nominal_target_xyz.copy()
     stack_level_x_dx = 0.0
     stack_pick_x_dx = 0.0
+    stack_pick_level2_extra_dx = 0.0
+    stack_pick_near_z_extra = 0.0
+    stack_pick_far_z_extra = 0.0
+    stack_anchor_x_dx = 0.0
     stack_pick_x_meta = {
         "enabled": bool(STACK_PICK_X_OFFSET_ENABLED),
         "applied": False,
         "reason": "base_level_no_offset" if int(level) <= 0 else "disabled",
         "offset_m": 0.0,
     }
+    if (
+        bool(STACK_ANCHOR_X_COMP_ENABLED)
+        and int(level) > 0
+        and bool(stack_anchor_xy_locked)
+        and bool(_stack_anchor_x_comp_allowed(stack_anchor_source))
+    ):
+        stack_anchor_x_dx = (
+            float(STACK_ANCHOR_X_COMP_LEVEL1_M)
+            if int(level) == 1
+            else float(STACK_ANCHOR_X_COMP_M)
+        )
+        print(
+            f"[StackAnchorXComp] section={section} level={int(level)} "
+            f"source={stack_anchor_source} dx={float(stack_anchor_x_dx):+.3f}"
+        )
+    elif (
+        bool(STACK_ANCHOR_X_COMP_ENABLED)
+        and int(level) > 0
+        and bool(stack_anchor_xy_locked)
+    ):
+        print(
+            f"[StackAnchorXComp] section={section} level={int(level)} "
+            f"source={stack_anchor_source} skipped=commanded_base_anchor dx=+0.000"
+        )
     stack_pick_x_offset_allowed = str(stack_anchor_source) == "commanded_place_base_level0"
     if bool(STACK_PICK_X_OFFSET_ENABLED) and int(level) > 0 and bool(stack_pick_x_offset_allowed):
         stack_pick_x_dx, stack_pick_x_meta = compute_stack_pick_x_offset(
             getattr(state, "last_pick_measured_xyz", None)
         )
-        if str(stack_pick_x_meta.get("reason", "")) != "ok" and bool(STACK_PICK_X_OFFSET_REQUIRE_PICK_X):
+        stack_pick_reason = str(stack_pick_x_meta.get("reason", ""))
+        stack_pick_nonfatal = stack_pick_reason == "positive_x_offset_suppressed"
+        if stack_pick_reason != "ok" and not bool(stack_pick_nonfatal) and bool(STACK_PICK_X_OFFSET_REQUIRE_PICK_X):
             print(
                 f"[StackPickXOffset] failed reason={stack_pick_x_meta.get('reason')} "
                 f"level={int(level)} require_pick_x={bool(STACK_PICK_X_OFFSET_REQUIRE_PICK_X)}"
@@ -700,6 +734,11 @@ def execute_prompted_place_action(
                 "expected_xyz": _finite_xyz_or_none(nominal_target_xyz),
                 "command_xyz": _finite_xyz_or_none(command_target_xyz),
                 "stack_pick_x_offset_m": 0.0,
+                "stack_pick_level2_extra_m": 0.0,
+                "stack_pick_near_z_extra_m": 0.0,
+                "stack_pick_far_z_extra_m": 0.0,
+                "stack_anchor_x_comp_m": float(stack_anchor_x_dx),
+                "stack_hydrate_anchor_x_comp_m": float(stack_anchor_x_dx),
                 "stack_pick_x_offset_meta": dict(stack_pick_x_meta),
                 "stack_level_x_offset_m": 0.0,
                 "stack_anchor_xyz": (None if stack_anchor_xyz is None else [float(stack_anchor_xyz[0]), float(stack_anchor_xyz[1]), float(stack_anchor_xyz[2])]),
@@ -713,7 +752,26 @@ def execute_prompted_place_action(
             stack_level_x_dx = float(STACK_X_LEVEL1_OFFSET)
         elif int(level) == 2:
             stack_level_x_dx = float(STACK_X_LEVEL2_OFFSET)
-    command_target_xyz[0] = float(nominal_target_xyz[0]) + float(stack_pick_x_dx) + float(stack_level_x_dx)
+    if (
+        bool(STACK_PICK_X_OFFSET_ENABLED)
+        and int(level) >= 2
+        and bool(stack_pick_x_offset_allowed)
+    ):
+        stack_pick_level2_extra_dx = float(STACK_PICK_X_LEVEL2_EXTRA_M)
+        stack_pick_x_meta["level2_extra_m"] = float(stack_pick_level2_extra_dx)
+    command_target_xyz[0] = (
+        float(nominal_target_xyz[0])
+        + float(stack_pick_x_dx)
+        + float(stack_pick_level2_extra_dx)
+        + float(stack_level_x_dx)
+        + float(stack_anchor_x_dx)
+    )
+    if str(stack_pick_x_meta.get("reason", "")) == "ok" and float(stack_pick_x_dx) < 0.0:
+        stack_pick_near_z_extra = float(STACK_PICK_X_NEAR_Z_EXTRA_M)
+        command_target_xyz[2] = float(command_target_xyz[2]) + float(stack_pick_near_z_extra)
+    elif str(stack_pick_x_meta.get("reason", "")) == "ok" and float(stack_pick_x_dx) > 0.0:
+        stack_pick_far_z_extra = float(STACK_PICK_X_FAR_Z_EXTRA_M)
+        command_target_xyz[2] = float(command_target_xyz[2]) + float(stack_pick_far_z_extra)
     print(
         f"[StackPickXOffset] level={int(level)} "
         f"enabled={bool(STACK_PICK_X_OFFSET_ENABLED)} "
@@ -724,10 +782,14 @@ def execute_prompted_place_action(
         f"t={float(stack_pick_x_meta.get('t', 0.0)):.2f} "
         f"x_nom={float(nominal_target_xyz[0]):.3f} "
         f"dx={float(stack_pick_x_dx):+.3f} "
+        f"level2_extra_dx={float(stack_pick_level2_extra_dx):+.3f} "
         f"legacy_dx={float(stack_level_x_dx):+.3f} "
+        f"anchor_dx={float(stack_anchor_x_dx):+.3f} "
         f"x_cmd={float(command_target_xyz[0]):.3f} "
         f"y={float(nominal_target_xyz[1]):.3f} "
-        f"z={float(nominal_target_xyz[2]):.3f}"
+        f"z={float(command_target_xyz[2]):.3f} "
+        f"near_z_extra={float(stack_pick_near_z_extra):+.3f} "
+        f"far_z_extra={float(stack_pick_far_z_extra):+.3f}"
     )
     pre_reconcile = reconcile_scene(
         state=state,
@@ -748,6 +810,11 @@ def execute_prompted_place_action(
             "command_xyz": _finite_xyz_or_none(command_target_xyz),
             "stack_level_x_offset_m": float(stack_level_x_dx),
             "stack_pick_x_offset_m": float(stack_pick_x_dx),
+            "stack_pick_level2_extra_m": float(stack_pick_level2_extra_dx),
+            "stack_pick_near_z_extra_m": float(stack_pick_near_z_extra),
+            "stack_pick_far_z_extra_m": float(stack_pick_far_z_extra),
+            "stack_anchor_x_comp_m": float(stack_anchor_x_dx),
+            "stack_hydrate_anchor_x_comp_m": float(stack_anchor_x_dx),
             "stack_pick_x_offset_meta": dict(stack_pick_x_meta),
             "stack_anchor_xyz": (None if stack_anchor_xyz is None else [float(stack_anchor_xyz[0]), float(stack_anchor_xyz[1]), float(stack_anchor_xyz[2])]),
             "stack_anchor_source": str(stack_anchor_source),
@@ -792,6 +859,11 @@ def execute_prompted_place_action(
         "command_xyz": _finite_xyz_or_none(command_target_xyz),
         "stack_level_x_offset_m": float(stack_level_x_dx),
         "stack_pick_x_offset_m": float(stack_pick_x_dx),
+        "stack_pick_level2_extra_m": float(stack_pick_level2_extra_dx),
+        "stack_pick_near_z_extra_m": float(stack_pick_near_z_extra),
+        "stack_pick_far_z_extra_m": float(stack_pick_far_z_extra),
+        "stack_anchor_x_comp_m": float(stack_anchor_x_dx),
+        "stack_hydrate_anchor_x_comp_m": float(stack_anchor_x_dx),
         "stack_pick_x_offset_meta": dict(stack_pick_x_meta),
         "place_bias_xy_m": [float(stack_place_x_bias_m), float(stack_place_y_bias_m)],
         "place_cmd_offset_xy_m": [
